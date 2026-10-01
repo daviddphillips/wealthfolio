@@ -177,27 +177,15 @@ fn map_provider_asset_class_to_taxonomy(name: &str) -> Option<&'static str> {
     }
 }
 
-/// Divisor that converts a provider's weights to fractions.
-///
-/// The unit is decided once per list rather than per weight: a weight just over
-/// 1.0 is still a fraction when the list is fractional. Yahoo reports a
-/// fund-of-funds such as CAGE.TO as stock 1.0046 / cash 0.0051 / other -0.0097;
-/// judging each weight alone read the stock weight as 1.0046%, leaving almost the
-/// whole fund unclassified.
-fn provider_weight_scale(weights: &[f64]) -> Option<f64> {
-    let total: f64 = weights.iter().sum();
-    if total <= 2.0 {
-        Some(1.0)
-    } else if total <= 200.0 {
-        Some(100.0)
-    } else {
-        None
-    }
+/// Validate a provider weight already expressed as a fraction (1.0 = 100%).
+/// Leveraged funds can report fractions above 1.0; units belong to the provider.
+fn parse_provider_weight(weight: f64) -> Option<f64> {
+    (weight.is_finite() && weight > 0.0).then_some(weight)
 }
 
 fn weights_to_basis_points(weights: BTreeMap<&'static str, f64>) -> Vec<(String, i32)> {
     let total_weight: f64 = weights.values().sum();
-    if total_weight <= 0.0 {
+    if !total_weight.is_finite() || total_weight <= 0.0 {
         return Vec::new();
     }
 
@@ -437,6 +425,7 @@ fn map_country_to_region(country: &str) -> Option<&'static str> {
 #[derive(Debug, Clone)]
 pub struct ProviderWeight {
     pub name: String,
+    /// Fractional weight (1.0 = 100%), which can exceed 1.0 for leveraged funds.
     pub weight: f64,
 }
 
@@ -444,29 +433,18 @@ pub type SectorWeight = ProviderWeight;
 pub type ClassWeight = ProviderWeight;
 
 fn parse_weighted_json(json: &str) -> Vec<ProviderWeight> {
-    let raw: Vec<(String, f64)> = serde_json::from_str::<Vec<serde_json::Value>>(json)
+    serde_json::from_str::<Vec<serde_json::Value>>(json)
         .map(|weights| {
             weights
                 .iter()
                 .filter_map(|v| {
                     let name = v.get("name")?.as_str()?.to_string();
-                    let weight = v.get("weight")?.as_f64()?;
-                    (weight.is_finite() && weight > 0.0).then_some((name, weight))
+                    let weight = parse_provider_weight(v.get("weight")?.as_f64()?)?;
+                    Some(ProviderWeight { name, weight })
                 })
                 .collect()
         })
-        .unwrap_or_default();
-
-    let weights: Vec<f64> = raw.iter().map(|(_, weight)| *weight).collect();
-    let Some(scale) = provider_weight_scale(&weights) else {
-        return Vec::new();
-    };
-    raw.into_iter()
-        .map(|(name, weight)| ProviderWeight {
-            name,
-            weight: weight / scale,
-        })
-        .collect()
+        .unwrap_or_default()
 }
 
 /// Parsed provider profile for auto-classification
@@ -479,7 +457,8 @@ pub struct ClassificationInput {
     pub country: Option<String>,
 }
 
-/// Raw provider profile fields used for taxonomy classification.
+/// Provider profile fields used for taxonomy classification.
+/// Weighted JSON fields contain provider-normalized fractions, never percentages.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ProviderProfileClassification<'a> {
     pub quote_type: Option<&'a str>,
@@ -1051,27 +1030,112 @@ mod tests {
     }
 
     #[test]
-    fn test_parse_weighted_json_keeps_fraction_scale_above_one() {
-        // Yahoo topHoldings for CAGE.TO (non-positive weights are dropped upstream).
-        let classes = parse_weighted_json(
-            r#"[{"name":"stock","weight":1.0046},{"name":"cash","weight":0.0051}]"#,
-        );
-        let assignment_map: BTreeMap<_, _> = asset_class_assignments_from_provider(&classes)
-            .into_iter()
-            .collect();
+    fn test_yahoo_asset_allocations_preserve_fractional_units() {
+        // Captured Yahoo positions after the adapter drops non-positive values.
+        // Expected assignments retain the existing positive-only allocation policy.
+        let cases = [
+            (
+                "CAGE.TO",
+                r#"[{"name":"stock","weight":1.0046},{"name":"cash","weight":0.0050999997}]"#,
+                vec![("EQUITY", 9949), ("CASH_BANK_DEPOSITS", 51)],
+            ),
+            (
+                "RSSY",
+                r#"[{"name":"stock","weight":0.6381},{"name":"bond","weight":1.157},{"name":"other","weight":0.32919997}]"#,
+                vec![("EQUITY", 3555), ("FIXED_INCOME", 6445)],
+            ),
+            (
+                "PSLDX",
+                r#"[{"name":"stock","weight":1.0141001},{"name":"bond","weight":1.5281}]"#,
+                vec![("EQUITY", 3989), ("FIXED_INCOME", 6011)],
+            ),
+            (
+                "SQQQ",
+                r#"[{"name":"cash","weight":3.687},{"name":"bond","weight":0.2604},{"name":"other","weight":0.0529}]"#,
+                vec![("CASH_BANK_DEPOSITS", 9340), ("FIXED_INCOME", 660)],
+            ),
+            (
+                "SDS",
+                r#"[{"name":"cash","weight":2.7470999},{"name":"bond","weight":0.0552},{"name":"other","weight":0.19790001}]"#,
+                vec![("CASH_BANK_DEPOSITS", 9803), ("FIXED_INCOME", 197)],
+            ),
+            (
+                "RSST",
+                r#"[{"name":"stock","weight":1.5199001},{"name":"cash","weight":1.2539},{"name":"other","weight":0.4156}]"#,
+                vec![("EQUITY", 5479), ("CASH_BANK_DEPOSITS", 4521)],
+            ),
+            (
+                "VCIT",
+                r#"[{"name":"bond","weight":1.0002999},{"name":"convertible","weight":0.0004}]"#,
+                vec![("FIXED_INCOME", 10000)],
+            ),
+            (
+                "XEC.TO",
+                r#"[{"name":"stock","weight":1.0032},{"name":"preferred","weight":0.0002}]"#,
+                vec![("EQUITY", 9998), ("FIXED_INCOME", 2)],
+            ),
+            (
+                "XBB.TO",
+                r#"[{"name":"bond","weight":1.0001999},{"name":"convertible","weight":0.00090000004}]"#,
+                vec![("FIXED_INCOME", 10000)],
+            ),
+        ];
 
-        assert_eq!(assignment_map.get("EQUITY"), Some(&9949));
-        assert_eq!(assignment_map.get("CASH_BANK_DEPOSITS"), Some(&51));
+        for (symbol, json, expected) in cases {
+            let input = ClassificationInput::from_provider_profile(ProviderProfileClassification {
+                quote_type: Some("ETF"),
+                classes_json: Some(json),
+                ..Default::default()
+            });
+            let assignments: BTreeMap<_, _> = asset_class_assignments_from_input(&input)
+                .into_iter()
+                .collect();
+            let expected: BTreeMap<_, _> = expected
+                .into_iter()
+                .map(|(category, weight)| (category.to_string(), weight))
+                .collect();
+
+            assert_eq!(assignments, expected, "{symbol}");
+        }
     }
 
     #[test]
-    fn test_parse_weighted_json_percentages() {
-        let classes = parse_weighted_json(
-            r#"[{"name":"stock","weight":65},{"name":"bond","weight":25},{"name":"cash","weight":10}]"#,
-        );
-        let weights: Vec<f64> = classes.iter().map(|c| c.weight).collect();
+    fn test_asset_class_assignments_reject_overflow() {
+        for json in [
+            r#"[{"name":"stock","weight":1e308},{"name":"bond","weight":1e308}]"#,
+            r#"[{"name":"bond","weight":1e308},{"name":"preferred","weight":1e308}]"#,
+        ] {
+            let classes = parse_weighted_json(json);
+            assert_eq!(classes.len(), 2);
+            assert!(asset_class_assignments_from_provider(&classes).is_empty());
+        }
+    }
 
-        assert_eq!(weights, vec![0.65, 0.25, 0.10]);
+    #[test]
+    fn test_parse_weighted_json_preserves_partial_allocation_and_filters_invalid_entries() {
+        let classes = parse_weighted_json(
+            r#"[
+                {"name":"stock","weight":0.60},
+                {"name":"bond","weight":-0.30},
+                {"name":"cash","weight":0},
+                {"name":"other","weight":"0.10"},
+                {"name":null,"weight":0.10},
+                {"name":"preferred"}
+            ]"#,
+        );
+        assert_eq!(classes.len(), 1);
+        assert_eq!(
+            asset_class_assignments_from_provider(&classes),
+            vec![("EQUITY".to_string(), 6000)]
+        );
+        assert!(parse_weighted_json("invalid JSON").is_empty());
+    }
+
+    #[test]
+    fn test_parse_provider_weight_rejects_non_finite_values() {
+        for weight in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            assert!(parse_provider_weight(weight).is_none());
+        }
     }
 
     #[test]
@@ -1248,7 +1312,7 @@ mod tests {
 
     #[test]
     fn test_parse_classes_json() {
-        let json = r#"[{"name":"stock","weight":60},{"name":"bond","weight":40}]"#;
+        let json = r#"[{"name":"stock","weight":0.60},{"name":"bond","weight":0.40}]"#;
         let input = ClassificationInput::from_provider_profile(ProviderProfileClassification {
             quote_type: Some("ETF"),
             classes_json: Some(json),
@@ -1308,11 +1372,13 @@ mod tests {
             ),
         ]));
         let classifier = AutoClassificationService::new(service.clone());
-        let input = ClassificationInput {
-            quote_type: Some("ETF".to_string()),
-            name: Some("Amundi Euro Government Bond 3-5Y UCITS ETF".to_string()),
+        let input = ClassificationInput::from_provider_profile(ProviderProfileClassification {
+            quote_type: Some("ETF"),
+            classes_json: Some(
+                r#"[{"name":"stock","weight":0.6381},{"name":"bond","weight":1.157},{"name":"other","weight":0.32919997}]"#,
+            ),
             ..Default::default()
-        };
+        });
 
         classifier.classify_asset("asset-1", &input).await.unwrap();
 
