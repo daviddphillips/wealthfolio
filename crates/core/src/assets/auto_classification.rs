@@ -239,6 +239,21 @@ fn asset_class_assignments_from_provider(classes: &[ClassWeight]) -> Vec<(String
     weights_to_basis_points(mapped)
 }
 
+/// Maps provider sector weights to GICS sectors, merging duplicates and keeping the
+/// total within 10000 bp. Rounding each weight on its own could exceed 100% (XEF.TO's
+/// eleven sectors round to 10002 bp), which a taxonomy replacement rejects.
+fn sector_assignments_from_input(input: &ClassificationInput) -> Vec<(String, i32)> {
+    let mut mapped = BTreeMap::new();
+    for sector in &input.sectors {
+        if let Some(category_id) = map_sector_to_gics(&sector.name) {
+            if sector.weight.is_finite() && sector.weight > 0.0 {
+                *mapped.entry(category_id).or_insert(0.0) += sector.weight;
+            }
+        }
+    }
+    weights_to_basis_points(mapped)
+}
+
 fn asset_class_assignments_from_input(input: &ClassificationInput) -> Vec<(String, i32)> {
     if !input.asset_classes.is_empty() {
         return asset_class_assignments_from_provider(&input.asset_classes);
@@ -627,19 +642,7 @@ impl AutoClassificationService {
         }
 
         // 3. Classify sectors (industries_gics)
-        let sector_assignments: Vec<(String, i32)> = input
-            .sectors
-            .iter()
-            .filter_map(|sector| {
-                let category_id = map_sector_to_gics(&sector.name)?;
-                let weight_bp = (sector.weight * 10000.0).round() as i32;
-                if weight_bp > 0 {
-                    Some((category_id.to_string(), weight_bp.min(10000)))
-                } else {
-                    None
-                }
-            })
-            .collect();
+        let sector_assignments = sector_assignments_from_input(input);
         if !sector_assignments.is_empty() || !input.sectors.is_empty() {
             let result_sectors: Vec<(String, f64)> = sector_assignments
                 .iter()
@@ -774,17 +777,16 @@ impl AutoClassificationService {
             .iter()
             .any(|assignment| !assignment.source.eq_ignore_ascii_case(AUTO_SOURCE));
 
-        for assignment in taxonomy_assignments
-            .iter()
-            .filter(|assignment| assignment.source.eq_ignore_ascii_case(AUTO_SOURCE))
-        {
-            self.taxonomy_service
-                .remove_asset_assignment(&assignment.id)
-                .await
-                .map_err(|e| e.to_string())?;
-        }
-
         if has_non_auto_assignment {
+            for assignment in taxonomy_assignments
+                .iter()
+                .filter(|assignment| assignment.source.eq_ignore_ascii_case(AUTO_SOURCE))
+            {
+                self.taxonomy_service
+                    .remove_asset_assignment(&assignment.id)
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             debug!(
                 "Skipping AUTO classification for {} {} because non-AUTO assignments exist",
                 asset_id, taxonomy_id
@@ -792,38 +794,27 @@ impl AutoClassificationService {
             return Ok(0);
         }
 
-        let assignment_count = assignments.len();
-        for (category_id, weight) in assignments {
-            self.assign_to_taxonomy(asset_id, taxonomy_id, &category_id, weight)
-                .await?;
-        }
-
-        Ok(assignment_count)
-    }
-
-    /// Helper to assign an asset to a taxonomy category
-    async fn assign_to_taxonomy(
-        &self,
-        asset_id: &str,
-        taxonomy_id: &str,
-        category_id: &str,
-        weight: i32,
-    ) -> Result<(), String> {
-        let assignment = NewAssetTaxonomyAssignment {
-            id: None, // Auto-generate ID
-            asset_id: asset_id.to_string(),
-            taxonomy_id: taxonomy_id.to_string(),
-            category_id: category_id.to_string(),
-            weight,
-            source: AUTO_SOURCE.to_string(),
-        };
-
-        self.taxonomy_service
-            .assign_asset_to_category(assignment)
+        // One transactional replace per taxonomy. Removing and inserting one row at a
+        // time left partial classifications when enrichment was cancelled mid-way
+        // (queue_worker runs it under a 30s timeout), e.g. 4 of 11 sectors on XEF.TO.
+        let replacement: Vec<NewAssetTaxonomyAssignment> = assignments
+            .into_iter()
+            .map(|(category_id, weight)| NewAssetTaxonomyAssignment {
+                id: None, // Auto-generate ID
+                asset_id: asset_id.to_string(),
+                taxonomy_id: taxonomy_id.to_string(),
+                category_id,
+                weight,
+                source: AUTO_SOURCE.to_string(),
+            })
+            .collect();
+        let replaced = self
+            .taxonomy_service
+            .replace_asset_taxonomy_assignments(asset_id, taxonomy_id, replacement)
             .await
             .map_err(|e| e.to_string())?;
 
-        Ok(())
+        Ok(replaced.len())
     }
 }
 
@@ -1307,6 +1298,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_auto_classification_replaces_partial_sectors_in_one_write() {
+        // A previous run that was cancelled after 4 of XEF.TO's 11 sectors.
+        let service = Arc::new(MockTaxonomyService::with_assignments(vec![
+            assignment("s60", "asset-1", "industries_gics", "60", 270, AUTO_SOURCE),
+            assignment("s25", "asset-1", "industries_gics", "25", 817, AUTO_SOURCE),
+            assignment("s15", "asset-1", "industries_gics", "15", 673, AUTO_SOURCE),
+            assignment("s30", "asset-1", "industries_gics", "30", 628, AUTO_SOURCE),
+        ]));
+        let classifier = AutoClassificationService::new(service.clone());
+        let input = ClassificationInput::from_provider_profile(ProviderProfileClassification {
+            quote_type: Some("ETF"),
+            name: Some("iShares Core MSCI EAFE IMI Index ETF"),
+            sectors_json: Some(
+                r#"[{"name":"Realestate","weight":0.027},{"name":"Consumer Cyclical","weight":0.0817},
+                {"name":"Basic Materials","weight":0.0673},{"name":"Consumer Defensive","weight":0.0628},
+                {"name":"Technology","weight":0.1113},{"name":"Communication Services","weight":0.0465},
+                {"name":"Financial Services","weight":0.2429},{"name":"Utilities","weight":0.0339},
+                {"name":"Industrials","weight":0.1939},{"name":"Energy","weight":0.0369},
+                {"name":"Healthcare","weight":0.096}]"#,
+            ),
+            ..Default::default()
+        });
+
+        classifier.classify_asset("asset-1", &input).await.unwrap();
+
+        let sectors = service.assignments_for("asset-1", "industries_gics");
+        // These weights round to 10002 bp one by one; normalized they fill exactly 100%.
+        assert_eq!(sectors.len(), 11);
+        assert_eq!(sectors.iter().map(|a| a.weight).sum::<i32>(), 10000);
+        assert!(sectors.iter().all(|a| a.source == AUTO_SOURCE));
+        // Every taxonomy is written with one replacement, never row by row.
+        assert_eq!(*service.single_assignment_writes.lock().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_sector_assignments_merge_duplicate_gics_sectors() {
+        let input = ClassificationInput::from_provider_profile(ProviderProfileClassification {
+            sectors_json: Some(
+                r#"[{"name":"Financials","weight":0.3},{"name":"Financial Services","weight":0.2},
+                {"name":"Technology","weight":0.5}]"#,
+            ),
+            ..Default::default()
+        });
+
+        let assignment_map: BTreeMap<_, _> =
+            sector_assignments_from_input(&input).into_iter().collect();
+
+        assert_eq!(assignment_map.get("40"), Some(&5000));
+        assert_eq!(assignment_map.get("45"), Some(&5000));
+    }
+
+    #[tokio::test]
     async fn test_auto_classification_clears_stale_auto_when_provider_data_is_unmapped() {
         let service = Arc::new(MockTaxonomyService::with_assignments(vec![
             assignment(
@@ -1502,6 +1545,7 @@ mod tests {
     struct MockTaxonomyService {
         assignments: Mutex<Vec<AssetTaxonomyAssignment>>,
         regions: Vec<Category>,
+        single_assignment_writes: Mutex<usize>,
     }
 
     impl MockTaxonomyService {
@@ -1509,6 +1553,7 @@ mod tests {
             Self {
                 assignments: Mutex::new(assignments),
                 regions: Vec::new(),
+                single_assignment_writes: Mutex::new(0),
             }
         }
 
@@ -1516,6 +1561,7 @@ mod tests {
             Self {
                 assignments: Mutex::new(Vec::new()),
                 regions,
+                single_assignment_writes: Mutex::new(0),
             }
         }
 
@@ -1633,6 +1679,7 @@ mod tests {
             &self,
             assignment: NewAssetTaxonomyAssignment,
         ) -> Result<AssetTaxonomyAssignment> {
+            *self.single_assignment_writes.lock().unwrap() += 1;
             let mut assignments = self.assignments.lock().unwrap();
             if let Some(existing) = assignments.iter_mut().find(|existing| {
                 existing.asset_id == assignment.asset_id
@@ -1662,11 +1709,32 @@ mod tests {
 
         async fn replace_asset_taxonomy_assignments(
             &self,
-            _asset_id: &str,
-            _taxonomy_id: &str,
-            _assignments: Vec<NewAssetTaxonomyAssignment>,
+            asset_id: &str,
+            taxonomy_id: &str,
+            replacement: Vec<NewAssetTaxonomyAssignment>,
         ) -> Result<Vec<AssetTaxonomyAssignment>> {
-            unimplemented!("unused in auto-classification tests")
+            let mut assignments = self.assignments.lock().unwrap();
+            assignments.retain(|existing| {
+                existing.asset_id != asset_id || existing.taxonomy_id != taxonomy_id
+            });
+            let created: Vec<AssetTaxonomyAssignment> = replacement
+                .into_iter()
+                .map(|assignment| {
+                    let id = assignment
+                        .id
+                        .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+                    self::assignment(
+                        &id,
+                        &assignment.asset_id,
+                        &assignment.taxonomy_id,
+                        &assignment.category_id,
+                        assignment.weight,
+                        &assignment.source,
+                    )
+                })
+                .collect();
+            assignments.extend(created.iter().cloned());
+            Ok(created)
         }
 
         async fn remove_asset_assignment(&self, id: &str) -> Result<usize> {
