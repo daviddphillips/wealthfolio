@@ -177,14 +177,19 @@ fn map_provider_asset_class_to_taxonomy(name: &str) -> Option<&'static str> {
     }
 }
 
-fn parse_provider_weight(weight: f64) -> Option<f64> {
-    if !weight.is_finite() || weight <= 0.0 {
-        return None;
-    }
-    if weight <= 1.0 {
-        Some(weight)
-    } else if weight <= 100.0 {
-        Some(weight / 100.0)
+/// Divisor that converts a provider's weights to fractions.
+///
+/// The unit is decided once per list rather than per weight: a weight just over
+/// 1.0 is still a fraction when the list is fractional. Yahoo reports a
+/// fund-of-funds such as CAGE.TO as stock 1.0046 / cash 0.0051 / other -0.0097;
+/// judging each weight alone read the stock weight as 1.0046%, leaving almost the
+/// whole fund unclassified.
+fn provider_weight_scale(weights: &[f64]) -> Option<f64> {
+    let total: f64 = weights.iter().sum();
+    if total <= 2.0 {
+        Some(1.0)
+    } else if total <= 200.0 {
+        Some(100.0)
     } else {
         None
     }
@@ -439,18 +444,29 @@ pub type SectorWeight = ProviderWeight;
 pub type ClassWeight = ProviderWeight;
 
 fn parse_weighted_json(json: &str) -> Vec<ProviderWeight> {
-    serde_json::from_str::<Vec<serde_json::Value>>(json)
+    let raw: Vec<(String, f64)> = serde_json::from_str::<Vec<serde_json::Value>>(json)
         .map(|weights| {
             weights
                 .iter()
                 .filter_map(|v| {
                     let name = v.get("name")?.as_str()?.to_string();
-                    let weight = parse_provider_weight(v.get("weight")?.as_f64()?)?;
-                    Some(ProviderWeight { name, weight })
+                    let weight = v.get("weight")?.as_f64()?;
+                    (weight.is_finite() && weight > 0.0).then_some((name, weight))
                 })
                 .collect()
         })
-        .unwrap_or_default()
+        .unwrap_or_default();
+
+    let weights: Vec<f64> = raw.iter().map(|(_, weight)| *weight).collect();
+    let Some(scale) = provider_weight_scale(&weights) else {
+        return Vec::new();
+    };
+    raw.into_iter()
+        .map(|(name, weight)| ProviderWeight {
+            name,
+            weight: weight / scale,
+        })
+        .collect()
 }
 
 /// Parsed provider profile for auto-classification
@@ -1032,6 +1048,40 @@ mod tests {
         assert_eq!(assignment_map.get("EQUITY"), Some(&6000));
         assert_eq!(assignment_map.get("FIXED_INCOME"), Some(&3000));
         assert_eq!(assignment_map.values().sum::<i32>(), 9000);
+    }
+
+    #[test]
+    fn test_parse_weighted_json_keeps_fraction_scale_above_one() {
+        // Yahoo topHoldings for CAGE.TO (non-positive weights are dropped upstream).
+        let classes = parse_weighted_json(
+            r#"[{"name":"stock","weight":1.0046},{"name":"cash","weight":0.0051}]"#,
+        );
+        let assignment_map: BTreeMap<_, _> = asset_class_assignments_from_provider(&classes)
+            .into_iter()
+            .collect();
+
+        assert_eq!(assignment_map.get("EQUITY"), Some(&9949));
+        assert_eq!(assignment_map.get("CASH_BANK_DEPOSITS"), Some(&51));
+    }
+
+    #[test]
+    fn test_parse_weighted_json_percentages() {
+        let classes = parse_weighted_json(
+            r#"[{"name":"stock","weight":65},{"name":"bond","weight":25},{"name":"cash","weight":10}]"#,
+        );
+        let weights: Vec<f64> = classes.iter().map(|c| c.weight).collect();
+
+        assert_eq!(weights, vec![0.65, 0.25, 0.10]);
+    }
+
+    #[test]
+    fn test_parse_weighted_json_fractions_unchanged() {
+        let classes = parse_weighted_json(
+            r#"[{"name":"stock","weight":0.9916},{"name":"cash","weight":0.0067},{"name":"other","weight":0.0017}]"#,
+        );
+        let weights: Vec<f64> = classes.iter().map(|c| c.weight).collect();
+
+        assert_eq!(weights, vec![0.9916, 0.0067, 0.0017]);
     }
 
     #[test]
