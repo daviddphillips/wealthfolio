@@ -679,6 +679,55 @@ mod tests {
     }
 
     #[test]
+    fn returns_of_capital_recover_cost_and_notional_distributions_add_it() {
+        let mut dividend = raw("d", "a1", "DIVIDEND", "2025-01-02T10:00:00Z");
+        dividend.asset_id = Some("aapl".into());
+        dividend.subtype = Some("RETURN_OF_CAPITAL".into());
+        dividend.amount = Some(dec!(45));
+        dividend.tax = Some(dec!(5));
+        let mut adjustment = raw("r", "a1", "ADJUSTMENT", "2025-01-02T11:00:00Z");
+        adjustment.asset_id = Some("aapl".into());
+        adjustment.subtype = Some("return_of_capital".into());
+        adjustment.amount = Some(dec!(20));
+        let mut notional = raw("n", "a1", "ADJUSTMENT", "2025-01-02T12:00:00Z");
+        notional.asset_id = Some("aapl".into());
+        notional.subtype = Some("NOTIONAL_DISTRIBUTION".into());
+        notional.amount = Some(dec!(10));
+        let ledger = ledger(vec![dividend, adjustment, notional], "SECURITIES");
+        assert!(ledger.diagnostics.is_empty());
+
+        // A dividend of capital books its cash, recovers its gross amount
+        // and is no income; what was withheld is still a charge.
+        assert_eq!(ledger.events[0].cash.as_ref().unwrap().amount, dec!(45));
+        match &ledger.events[0].action {
+            Action::ReturnOfCapital { amount, .. } => assert_eq!(*amount, dec!(50)),
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert_eq!(
+            ledger.events[0].attribution,
+            Attributed {
+                income: dec!(0),
+                fee: dec!(0),
+                tax: dec!(5),
+            }
+        );
+        // A return of capital adjustment books no cash and takes its amount
+        // back out of income; a notional distribution adds it.
+        assert!(ledger.events[1].cash.is_none());
+        match &ledger.events[1].action {
+            Action::ReturnOfCapital { amount, .. } => assert_eq!(*amount, dec!(20)),
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert_eq!(ledger.events[1].attribution.income, dec!(-20));
+        assert!(ledger.events[2].cash.is_none());
+        match &ledger.events[2].action {
+            Action::NotionalDistribution { amount, .. } => assert_eq!(*amount, dec!(10)),
+            other => panic!("unexpected action {other:?}"),
+        }
+        assert_eq!(ledger.events[2].attribution.income, dec!(10));
+    }
+
+    #[test]
     fn unpaired_transfer_without_marker_is_unknown_boundary() {
         let mut transfer = raw("t", "a1", "TRANSFER_IN", "2025-01-02T10:00:00Z");
         transfer.amount = Some(dec!(100));

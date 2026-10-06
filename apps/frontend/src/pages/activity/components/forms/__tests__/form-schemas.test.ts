@@ -97,6 +97,63 @@ describe("Form Schemas Validation", () => {
       }
     });
 
+    it.each([ACTIVITY_SUBTYPES.RETURN_OF_CAPITAL, ACTIVITY_SUBTYPES.NOTIONAL_DISTRIBUTION])(
+      "accepts a %s on a security with an amount and no quantity",
+      (subtype) => {
+        const result = adjustmentFormSchema.safeParse({
+          adjustmentMode: "securities",
+          accountId: "acc-123",
+          activityDate: new Date(),
+          assetId: "XEQT.TO",
+          amount: 12.5,
+          currency: "CAD",
+          subtype,
+        });
+
+        expect(result.success).toBe(true);
+      },
+    );
+
+    it.each([ACTIVITY_SUBTYPES.RETURN_OF_CAPITAL, ACTIVITY_SUBTYPES.NOTIONAL_DISTRIBUTION])(
+      "requires a positive amount for a %s",
+      (subtype) => {
+        const result = adjustmentFormSchema.safeParse({
+          adjustmentMode: "securities",
+          accountId: "acc-123",
+          activityDate: new Date(),
+          assetId: "XEQT.TO",
+          amount: 0,
+          currency: "CAD",
+          subtype,
+        });
+
+        expect(result.success).toBe(false);
+        if (!result.success) {
+          expect(result.error.issues).toEqual(
+            expect.arrayContaining([expect.objectContaining({ path: ["amount"] })]),
+          );
+        }
+      },
+    );
+
+    it("requires a security for a return of capital", () => {
+      const result = adjustmentFormSchema.safeParse({
+        adjustmentMode: "cash",
+        accountId: "acc-123",
+        activityDate: new Date(),
+        amount: 12.5,
+        currency: "CAD",
+        subtype: ACTIVITY_SUBTYPES.RETURN_OF_CAPITAL,
+      });
+
+      expect(result.success).toBe(false);
+      if (!result.success) {
+        expect(result.error.issues).toEqual(
+          expect.arrayContaining([expect.objectContaining({ path: ["assetId"] })]),
+        );
+      }
+    });
+
     it("derives cash and security edit modes without losing imported values", () => {
       const cashDefaults = ACTIVITY_FORM_CONFIG.ADJUSTMENT.getDefaults(
         {

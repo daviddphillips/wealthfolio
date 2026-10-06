@@ -4912,6 +4912,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn income_report_leaves_out_a_dividend_of_capital() {
+        // Engine rules R7.4: a return of capital is no income.
+        let (pool, writer) = setup_db();
+        let repo = ActivityRepository::new(pool.clone(), writer);
+        let mut conn = get_connection(&pool).expect("conn");
+        insert_account(&mut conn, "acc-income");
+        insert_activity_with_subtype(&mut conn, "plain", "acc-income", "DIVIDEND", None, None);
+        insert_activity_with_subtype(
+            &mut conn,
+            "capital",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            Some("return_of_capital"),
+        );
+        insert_activity_with_subtype(
+            &mut conn,
+            "drip",
+            "acc-income",
+            "DIVIDEND",
+            None,
+            Some("DRIP"),
+        );
+
+        for (id, amount) in [("capital", "7"), ("drip", "3")] {
+            diesel::update(activities::table.find(id))
+                .set(activities::amount.eq(Some(amount.to_string())))
+                .execute(&mut conn)
+                .expect("amount");
+        }
+
+        let rows = repo
+            .get_income_activities_data(Some(&[String::from("acc-income")]))
+            .expect("income data");
+        let mut amounts: Vec<Decimal> = rows.iter().map(|row| row.amount).collect();
+        amounts.sort_unstable();
+        assert_eq!(amounts, vec![Decimal::from(3), Decimal::from(100)]);
+    }
+
+    #[tokio::test]
     async fn edits_store_type_overrides_as_they_read() {
         let (pool, writer) = setup_db();
         let repo = ActivityRepository::new(pool.clone(), writer);

@@ -3502,6 +3502,113 @@ mod tests {
     }
 
     #[test]
+    fn asset_income_counts_returns_of_capital_and_notional_distributions_as_the_engine_does() {
+        // Engine rules R7.4: a dividend of capital is no income; a return of
+        // capital adjustment takes dividends back out; a notional distribution
+        // is income.
+        let date = NaiveDate::from_ymd_opt(2025, 2, 3).unwrap();
+        let fx_service = MockFxService::new(vec![]);
+        let asset_currencies = HashMap::from([("XEQT".to_string(), "CAD".to_string())]);
+        let activity = |id: &str, activity_type: &str, subtype: Option<&str>, amount| {
+            let mut activity = test_income_activity(
+                id,
+                "acc-1",
+                Some("XEQT"),
+                activity_type,
+                amount,
+                "CAD",
+                date,
+            );
+            activity.subtype = subtype.map(str::to_string);
+            activity
+        };
+        let activities = vec![
+            activity("dividend", ACTIVITY_TYPE_DIVIDEND, None, dec!(100)),
+            activity(
+                "capital",
+                ACTIVITY_TYPE_DIVIDEND,
+                Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL),
+                dec!(40),
+            ),
+            activity(
+                "reclassified",
+                ACTIVITY_TYPE_ADJUSTMENT,
+                Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL),
+                dec!(25),
+            ),
+            activity(
+                "notional",
+                ACTIVITY_TYPE_ADJUSTMENT,
+                Some(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION),
+                dec!(10),
+            ),
+            activity(
+                "expiry",
+                ACTIVITY_TYPE_ADJUSTMENT,
+                Some("OPTION_EXPIRY"),
+                dec!(7),
+            ),
+        ];
+
+        let income_by_asset = calculate_asset_income(
+            &activities,
+            &HashSet::new(),
+            &asset_currencies,
+            "CAD",
+            &fx_service,
+            chrono_tz::UTC,
+        );
+
+        let income = income_by_asset.get("XEQT").unwrap();
+        assert_eq!(income.local, dec!(85));
+        assert_eq!(income.base, dec!(85));
+    }
+
+    #[test]
+    fn asset_income_leaves_out_what_the_engine_rejected() {
+        // A notional distribution dated before the first purchase finds no
+        // units: the engine rejects it, so it is no income.
+        let date = NaiveDate::from_ymd_opt(2025, 2, 3).unwrap();
+        let fx_service = MockFxService::new(vec![]);
+        let asset_currencies = HashMap::from([("XEQT".to_string(), "CAD".to_string())]);
+        let mut notional = test_income_activity(
+            "notional",
+            "acc-1",
+            Some("XEQT"),
+            ACTIVITY_TYPE_ADJUSTMENT,
+            dec!(10),
+            "CAD",
+            date,
+        );
+        notional.subtype = Some(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION.to_string());
+        let activities = vec![
+            notional,
+            test_income_activity(
+                "dividend",
+                "acc-1",
+                Some("XEQT"),
+                ACTIVITY_TYPE_DIVIDEND,
+                dec!(100),
+                "CAD",
+                date,
+            ),
+        ];
+
+        let income_by_asset = calculate_asset_income(
+            &activities,
+            &HashSet::from(["notional".to_string()]),
+            &asset_currencies,
+            "CAD",
+            &fx_service,
+            chrono_tz::UTC,
+        );
+
+        let income = income_by_asset.get("XEQT").unwrap();
+        assert_eq!(income.local, dec!(100));
+        assert_eq!(income.base, dec!(100));
+    }
+
+    #[test]
     fn asset_income_uses_user_timezone_for_flow_date_fx() {
         let local_date = NaiveDate::from_ymd_opt(2025, 2, 3).unwrap();
         let utc_date = NaiveDate::from_ymd_opt(2025, 2, 4).unwrap();

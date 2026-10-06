@@ -528,6 +528,28 @@ mod tests {
     }
 
     #[test]
+    fn test_cost_basis_subtypes_are_canonicalized() {
+        assert_eq!(
+            NewActivity::canonicalize_subtype_for_activity("ADJUSTMENT", Some("return_of_capital"))
+                .as_deref(),
+            Some("RETURN_OF_CAPITAL")
+        );
+        assert_eq!(
+            NewActivity::canonicalize_subtype_for_activity("DIVIDEND", Some(" Return_Of_Capital "))
+                .as_deref(),
+            Some("RETURN_OF_CAPITAL")
+        );
+        assert_eq!(
+            NewActivity::canonicalize_subtype_for_activity(
+                "ADJUSTMENT",
+                Some("notional_distribution")
+            )
+            .as_deref(),
+            Some("NOTIONAL_DISTRIBUTION")
+        );
+    }
+
+    #[test]
     fn test_new_activity_treats_zero_income_value_source_as_missing() {
         let mut activity = create_test_new_activity();
         activity.activity_type = "INTEREST".to_string();
