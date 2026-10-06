@@ -690,7 +690,11 @@ async fn initialize_profile_state(
             classification_service.clone(),
             timezone.clone(),
         )
-        .with_income_dependencies(activity_repository.clone(), fx_service.clone())
+        .with_income_dependencies(
+            activity_repository.clone(),
+            fx_service.clone(),
+            projection_store.clone(),
+        )
         .with_lot_repository(lots_repository.clone()),
     );
 

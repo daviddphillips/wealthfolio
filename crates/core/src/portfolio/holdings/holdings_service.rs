@@ -1,5 +1,6 @@
 use crate::activities::{
-    Activity, ActivityRepositoryTrait, ACTIVITY_SUBTYPE_OPTION_EXPIRY, ACTIVITY_TYPE_ADJUSTMENT,
+    Activity, ActivityRepositoryTrait, ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION,
+    ACTIVITY_SUBTYPE_OPTION_EXPIRY, ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL, ACTIVITY_TYPE_ADJUSTMENT,
     ACTIVITY_TYPE_BUY, ACTIVITY_TYPE_DIVIDEND, ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL,
 };
 use crate::assets::{
@@ -12,6 +13,7 @@ use crate::fx::FxServiceTrait;
 use crate::lots::{AssetLotView, LotRecord, LotRepositoryTrait};
 use crate::portfolio::economic_events::ActivityEconomicsResolver;
 use crate::portfolio::holdings::holdings_model::{Holding, HoldingType, Instrument, MonetaryValue};
+use crate::portfolio::projection::{ActivityIssueKind, ProjectionStoreTrait};
 use crate::portfolio::snapshot::{self, SnapshotServiceTrait};
 use crate::utils::time_utils::{activity_date_in_tz, parse_user_timezone_or_default, user_today};
 use async_trait::async_trait;
@@ -110,6 +112,7 @@ pub trait HoldingIncomeServiceTrait: Send + Sync {
 pub struct HoldingIncomeService {
     activity_repository: Arc<dyn ActivityRepositoryTrait>,
     fx_service: Arc<dyn FxServiceTrait>,
+    projections: Arc<dyn ProjectionStoreTrait>,
     timezone: Arc<RwLock<String>>,
 }
 
@@ -117,11 +120,13 @@ impl HoldingIncomeService {
     pub fn new(
         activity_repository: Arc<dyn ActivityRepositoryTrait>,
         fx_service: Arc<dyn FxServiceTrait>,
+        projections: Arc<dyn ProjectionStoreTrait>,
         timezone: Arc<RwLock<String>>,
     ) -> Self {
         Self {
             activity_repository,
             fx_service,
+            projections,
             timezone,
         }
     }
@@ -137,6 +142,15 @@ impl HoldingIncomeServiceTrait for HoldingIncomeService {
         let activities = self
             .activity_repository
             .get_activities_by_account_ids(account_ids)?;
+        // What the engine rejected contributed nothing, so it is no income
+        // either, as the performance read path leaves it out.
+        let rejected: HashSet<String> = self
+            .projections
+            .activity_issues(account_ids)?
+            .into_iter()
+            .filter(|issue| issue.kind == ActivityIssueKind::Rejected)
+            .map(|issue| issue.activity_id)
+            .collect();
         let timezone = parse_user_timezone_or_default(
             &self
                 .timezone
@@ -145,6 +159,7 @@ impl HoldingIncomeServiceTrait for HoldingIncomeService {
         );
         Ok(calculate_asset_income(
             &activities,
+            &rejected,
             asset_currencies,
             base_currency,
             self.fx_service.as_ref(),
@@ -251,12 +266,14 @@ impl HoldingsService {
         mut self,
         activity_repository: Arc<dyn ActivityRepositoryTrait>,
         fx_service: Arc<dyn FxServiceTrait>,
+        projections: Arc<dyn ProjectionStoreTrait>,
     ) -> Self {
         let timezone = self.timezone.clone();
         self.activity_repository = Some(activity_repository.clone());
         self.with_income_service(Arc::new(HoldingIncomeService::new(
             activity_repository,
             fx_service,
+            projections,
             timezone,
         )))
     }
@@ -806,7 +823,14 @@ impl HoldingsService {
                             && activity.subtype.as_deref().is_some_and(|subtype| {
                                 subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY)
                             });
-                        is_trade || is_option_expiry
+                        // A return of capital realizes what exceeds the cost basis as
+                        // a capital gain, and in base its currency move (engine rules R7.4).
+                        let is_return_of_capital = (activity_type == ACTIVITY_TYPE_ADJUSTMENT
+                            || activity_type == ACTIVITY_TYPE_DIVIDEND)
+                            && activity.subtype.as_deref().is_some_and(|subtype| {
+                                subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL)
+                            });
+                        is_trade || is_option_expiry || is_return_of_capital
                     })
                     .map(|activity| activity.id)
                     .collect(),
@@ -968,6 +992,7 @@ fn refresh_total_return(holding: &mut Holding) {
 
 fn calculate_asset_income(
     activities: &[Activity],
+    rejected: &HashSet<String>,
     asset_currencies: &HashMap<String, String>,
     base_currency: &str,
     fx_service: &dyn FxServiceTrait,
@@ -976,14 +1001,13 @@ fn calculate_asset_income(
     let mut income_by_asset: HashMap<String, MonetaryValue> = HashMap::new();
 
     for activity in activities {
-        if !activity.is_posted() {
+        if !activity.is_posted() || rejected.contains(&activity.id) {
             continue;
         }
 
-        let activity_type = activity.effective_type();
-        if activity_type != ACTIVITY_TYPE_DIVIDEND && activity_type != ACTIVITY_TYPE_INTEREST {
+        let Some(amount) = asset_income_amount(activity) else {
             continue;
-        }
+        };
 
         let Some(asset_id) = activity.asset_id.as_ref() else {
             continue;
@@ -992,7 +1016,6 @@ fn calculate_asset_income(
             continue;
         };
 
-        let amount = activity_income_amount(activity);
         if amount.is_zero() {
             continue;
         }
@@ -1030,6 +1053,38 @@ fn calculate_asset_income(
     }
 
     income_by_asset
+}
+
+/// What an activity adds to its asset's income, as the portfolio engine counts
+/// it (engine rules R7.4): a dividend's or interest's gross amount, except a
+/// dividend of capital, which is none. A return of capital adjustment takes its
+/// amount back out of dividends already counted; a notional distribution adds
+/// it. Their cost basis changes are in the holding's gains, so the total return
+/// counts each once.
+fn asset_income_amount(activity: &Activity) -> Option<Decimal> {
+    let activity_type = activity.effective_type();
+    let return_of_capital = activity.subtype.as_deref().is_some_and(|subtype| {
+        subtype
+            .trim()
+            .eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL)
+    });
+    let notional = activity.subtype.as_deref().is_some_and(|subtype| {
+        subtype
+            .trim()
+            .eq_ignore_ascii_case(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION)
+    });
+    let adjusted = || activity.amount.unwrap_or_default().abs();
+    if activity_type == ACTIVITY_TYPE_DIVIDEND && return_of_capital {
+        None
+    } else if activity_type == ACTIVITY_TYPE_DIVIDEND || activity_type == ACTIVITY_TYPE_INTEREST {
+        Some(activity_income_amount(activity))
+    } else if activity_type == ACTIVITY_TYPE_ADJUSTMENT && return_of_capital {
+        Some(-adjusted())
+    } else if activity_type == ACTIVITY_TYPE_ADJUSTMENT && notional {
+        Some(adjusted())
+    } else {
+        None
+    }
 }
 
 fn activity_income_amount(activity: &Activity) -> Decimal {
@@ -3433,6 +3488,7 @@ mod tests {
 
         let income_by_asset = calculate_asset_income(
             &activities,
+            &HashSet::new(),
             &asset_currencies,
             "USD",
             &fx_service,
@@ -3469,6 +3525,7 @@ mod tests {
 
         let income_by_asset = calculate_asset_income(
             &[activity],
+            &HashSet::new(),
             &asset_currencies,
             "USD",
             &fx_service,
@@ -3497,6 +3554,7 @@ mod tests {
 
         let income_by_asset = calculate_asset_income(
             &activities,
+            &HashSet::new(),
             &asset_currencies,
             "GBP",
             &fx_service,

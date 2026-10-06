@@ -519,7 +519,7 @@ async fn build_context(
         sources: fact_sources.clone(),
         fx_service: fx_service.clone(),
         snapshot_service: snapshot_service.clone(),
-        projections: projection_store,
+        projections: projection_store.clone(),
         lots: lots_repository.clone(),
         window_cadence: WindowCadence::Year,
     }));
@@ -566,7 +566,11 @@ async fn build_context(
             classification_service.clone(),
             timezone.clone(),
         )
-        .with_income_dependencies(activity_repository.clone(), fx_service.clone())
+        .with_income_dependencies(
+            activity_repository.clone(),
+            fx_service.clone(),
+            projection_store,
+        )
         .with_lot_repository(lots_repository.clone()),
     );
 
