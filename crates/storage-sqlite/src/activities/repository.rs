@@ -2360,6 +2360,8 @@ impl ActivityRepositoryTrait for ActivityRepository {
 
         // Stored amount is final cash. Income reporting reverses charges to
         // gross income and never reconstructs a missing amount from quotes.
+        // A dividend of capital (RETURN_OF_CAPITAL) is no income: it reduces
+        // the asset's cost basis (engine rules R7.4).
         // IDs are internal UUIDs — safe to interpolate directly; escape single quotes defensively.
         let account_filter = match account_ids {
             Some(ids) if !ids.is_empty() => {
@@ -2394,6 +2396,8 @@ impl ActivityRepositoryTrait for ActivityRepository {
              INNER JOIN accounts acc ON a.account_id = acc.id
              WHERE {effective_type}
                    IN ('DIVIDEND', 'INTEREST', 'OTHER_INCOME')
+             AND NOT ({effective_type} = 'DIVIDEND'
+                      AND UPPER(TRIM(COALESCE(a.subtype, ''))) = 'RETURN_OF_CAPITAL')
              AND a.status = 'POSTED'
              AND acc.is_archived = 0
              {account_filter}
