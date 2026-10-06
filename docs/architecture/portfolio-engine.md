@@ -185,6 +185,12 @@ in the new days (a scheduled deposit) were outside the previous range, so their
 account refolds; a split among them revalues its asset's holders from the
 beginning. A refold reaches the account's transfer partners.
 
+A transactions-mode account with no activity has nothing to fold or price: a run
+writes its empty state as one row, on the last day. Any plan for it is a refold
+from `GENESIS`, which replaces that row. Revaluing it would clear the row and
+price no keyframe in its place, leaving a scope that includes it without a
+history; rewriting it from a later day would leave the old row behind.
+
 Holdings-mode accounts only revalue: their facts are observed snapshots. A
 refold is not resumed from a stored state: folding the refolded accounts (and
 their transfer partners) from the first activity in memory, without valuing or
