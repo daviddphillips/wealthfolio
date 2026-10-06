@@ -812,7 +812,8 @@ mod tests {
         let subtypes = get_subtypes_for_activity_type("DIVIDEND");
         assert!(subtypes.iter().any(|s| s.value == "DRIP"));
         assert!(subtypes.iter().any(|s| s.value == "DIVIDEND_IN_KIND"));
-        assert_eq!(subtypes.len(), 2); // DRIP and DIVIDEND_IN_KIND
+        assert!(subtypes.iter().any(|s| s.value == "RETURN_OF_CAPITAL"));
+        assert_eq!(subtypes.len(), 3); // DRIP, DIVIDEND_IN_KIND and RETURN_OF_CAPITAL
 
         let subtypes = get_subtypes_for_activity_type("INTEREST");
         assert!(subtypes.iter().any(|s| s.value == "STAKING_REWARD"));
