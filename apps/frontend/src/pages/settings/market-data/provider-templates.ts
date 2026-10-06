@@ -14,6 +14,9 @@ export interface ProviderTemplate {
   lowPath?: string;
   volumePath?: string;
   headers?: string;
+  /** Defaults to GET. A POST template sends `body`, a JSON request template. */
+  method?: "GET" | "POST";
+  body?: string;
   testSymbol: string;
 }
 
