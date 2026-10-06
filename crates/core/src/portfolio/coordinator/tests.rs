@@ -1113,6 +1113,150 @@ async fn a_new_day_revalues_only_the_new_day() {
     assert!(harness.coordinator.stale_accounts().unwrap().is_empty());
 }
 
+/// NOM-TRADE-01's CAD portfolio and a EUR account with nothing in it.
+fn with_an_empty_eur_account() -> ScenarioFacts {
+    let mut facts = scenario("NOM-TRADE-01").facts();
+    let mut empty = facts.accounts[0].clone();
+    empty.id = "acc-empty".to_string();
+    empty.name = "Empty".to_string();
+    empty.currency = "EUR".to_string();
+    facts.accounts.push(empty);
+    facts.fx_rates.push(eur_cad(
+        chrono::NaiveDate::from_ymd_opt(2025, 1, 1).unwrap(),
+        dec!(1.5),
+    ));
+    facts
+}
+
+fn eur_cad(day: chrono::NaiveDate, rate: Decimal) -> crate::fx::ExchangeRate {
+    crate::fx::ExchangeRate {
+        id: "fx-eur-cad".into(),
+        from_currency: "EUR".into(),
+        to_currency: "CAD".into(),
+        rate,
+        source: "MANUAL".into(),
+        timestamp: day.and_hms_opt(12, 0, 0).unwrap().and_utc(),
+    }
+}
+
+fn valuation_dates(rows: &[crate::portfolio::valuation::DailyAccountValuation]) -> Vec<NaiveDate> {
+    rows.iter().map(|row| row.valuation_date).collect()
+}
+
+/// A portfolio measures the same with and without an account that holds
+/// nothing.
+async fn assert_an_empty_account_changes_no_figure(h: &Harness, empty: &str) {
+    use crate::portfolio::performance::{
+        PerformanceService, PerformanceServiceTrait, PerformanceSummaryProfile,
+    };
+    let service = PerformanceService::new(
+        h.base_currency.clone(),
+        h.timezone.clone(),
+        h.sources.clone(),
+        h.valuation_repo.clone(),
+        h.lot_repo.clone(),
+    );
+    let modes = std::collections::HashMap::new();
+    let types = std::collections::HashMap::new();
+    let accounts: Vec<String> = h
+        .account_repo
+        .list(None, None, None)
+        .unwrap()
+        .into_iter()
+        .map(|a| a.id)
+        .collect();
+    let others: Vec<String> = accounts.iter().filter(|a| *a != empty).cloned().collect();
+    let mut measured = Vec::new();
+    for scope in [&accounts, &others] {
+        let result = service
+            .calculate_performance_summary_for_accounts(
+                "portfolio",
+                scope,
+                "",
+                &modes,
+                &types,
+                None,
+                None,
+                PerformanceSummaryProfile::Full,
+            )
+            .await
+            .unwrap();
+        measured.push(result);
+    }
+    let (with, without) = (&measured[0], &measured[1]);
+    assert!(without.returns.twr.is_some());
+    assert_eq!(
+        serde_json::to_value(&with.returns).unwrap(),
+        serde_json::to_value(&without.returns).unwrap()
+    );
+    assert_eq!(with.data_quality.warnings, without.data_quality.warnings);
+}
+
+/// An account with no activities is one row: its empty state on the last
+/// day. A conversion change refolds it whole rather than revaluing it from
+/// the change, which would clear that row and price nothing in its place.
+#[tokio::test]
+async fn a_rate_change_keeps_the_row_of_an_account_without_activities() {
+    let mut facts = with_an_empty_eur_account();
+    let live = harness(facts.clone()).await;
+    live.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert_eq!(valuation_dates(&live.rows("acc-empty")), vec![facts.as_of]);
+
+    let day = facts.as_of - chrono::Duration::days(3);
+    let rate = eur_cad(day, dec!(1.6));
+    live.fx_repo.add_rates(vec![rate.clone()]);
+    live.store
+        .mark(MarkerScope::Prices("fx-eur-cad".into()), day);
+    live.store.mark(MarkerScope::Fx("fx-eur-cad".into()), day);
+    let report = live
+        .coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        plan_of(&report, "acc-empty"),
+        Some(RebuildPlan::Refold { from: GENESIS })
+    );
+    assert_eq!(valuation_dates(&live.rows("acc-empty")), vec![facts.as_of]);
+    assert_an_empty_account_changes_no_figure(&live, "acc-empty").await;
+    facts.fx_rates.push(rate);
+    assert_matches_a_fresh_rebuild(&live, &facts, "after a rate change").await;
+}
+
+/// Days passing move an account with no activities to the new last day,
+/// skipped days included, and leave it current.
+#[tokio::test]
+async fn new_days_move_the_row_of_an_account_without_activities() {
+    let mut facts = with_an_empty_eur_account();
+    let live = harness(facts.clone()).await;
+    live.coordinator
+        .run_job(request(), &SilentObserver)
+        .await
+        .unwrap();
+
+    let later = facts.as_of + chrono::Duration::days(3);
+    crate::utils::clock::set_frozen(as_of_instant(later, &facts.timezone));
+    let report = live
+        .coordinator
+        .try_update_all(MarketSyncMode::None, &SilentObserver)
+        .await
+        .unwrap();
+    assert!(report.failures.is_empty(), "{:?}", report.failures);
+    assert_eq!(
+        plan_of(&report, "acc-empty"),
+        Some(RebuildPlan::Refold { from: GENESIS })
+    );
+    assert_eq!(valuation_dates(&live.rows("acc-empty")), vec![later]);
+    assert!(live.coordinator.stale_accounts().unwrap().is_empty());
+    assert_an_empty_account_changes_no_figure(&live, "acc-empty").await;
+    facts.as_of = later;
+    assert_matches_a_fresh_rebuild(&live, &facts, "days later").await;
+}
+
 /// Every account's rows and lots equal those of a fresh run over `facts`.
 async fn assert_matches_a_fresh_rebuild(live: &Harness, facts: &ScenarioFacts, label: &str) {
     let fresh = harness(facts.clone()).await;
