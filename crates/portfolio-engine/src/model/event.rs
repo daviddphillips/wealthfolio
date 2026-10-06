@@ -43,7 +43,9 @@ pub struct EconomicEvent {
 }
 
 /// Income, fees and taxes an event contributes to performance attribution,
-/// as magnitudes in the activity currency (Appendix A, cross-cutting rules).
+/// as magnitudes in the activity currency (Appendix A, cross-cutting rules),
+/// except a return of capital adjustment's income, which is negative: it takes
+/// capital back out of dividends already counted (rules R7.4).
 /// Decided once here so no later stage re-reads the raw activity.
 #[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
 pub struct Attributed {
@@ -123,6 +125,22 @@ pub enum Action {
         asset: AssetId,
         #[serde(with = "crate::model::decimal_serde")]
         quantity: Decimal,
+    },
+    /// Recovers `amount` of the position's cost: capital paid back, not
+    /// income. Cost beyond what the lots hold is a capital gain (rules R7.4).
+    ReturnOfCapital {
+        asset: AssetId,
+        /// Magnitude in the activity currency.
+        #[serde(with = "crate::model::decimal_serde")]
+        amount: Decimal,
+    },
+    /// Adds `amount` to the position's cost: a taxable distribution
+    /// reinvested without new units (rules R7.4).
+    NotionalDistribution {
+        asset: AssetId,
+        /// Magnitude in the activity currency.
+        #[serde(with = "crate::model::decimal_serde")]
+        amount: Decimal,
     },
 }
 

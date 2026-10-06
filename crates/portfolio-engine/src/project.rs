@@ -432,7 +432,9 @@ fn footprint(event: &EconomicEvent) -> Option<&AssetId> {
         Action::Trade { asset, .. }
         | Action::SecurityTransfer { asset, .. }
         | Action::Split { asset, .. }
-        | Action::OptionExpiry { asset, .. } => Some(asset),
+        | Action::OptionExpiry { asset, .. }
+        | Action::ReturnOfCapital { asset, .. }
+        | Action::NotionalDistribution { asset, .. } => Some(asset),
     }
 }
 
@@ -634,6 +636,13 @@ impl Projector<'_> {
         // charges per unit, and what it holds now is its original, so the
         // slices it gives carry their cost.
         let kept = &position.lots[anchor];
+        // Its rates carry the members' book cost; it keeps the amounts too
+        // when an adjustment stored any, so a cost a return of capital took
+        // to zero keeps its book cost.
+        let adjusted = members.iter().any(|(index, ..)| {
+            let lot = &position.lots[*index];
+            lot.book_cost_account.is_some() || lot.book_cost_base.is_some()
+        });
         let pool = Lot {
             id: kept.id.clone(),
             acquisition,
@@ -660,6 +669,8 @@ impl Projector<'_> {
             base_currency: Some(base),
             source_event: None,
             split_ratio: Decimal::ONE,
+            book_cost_account: adjusted.then_some(in_account),
+            book_cost_base: adjusted.then_some(in_base),
         };
         let pooled: BTreeSet<usize> = members.iter().map(|(index, ..)| *index).collect();
         let lots = std::mem::take(&mut position.lots);
@@ -871,6 +882,14 @@ impl Projector<'_> {
             Action::Split { asset, ratio } => self.split(event, state, asset, *ratio),
             Action::OptionExpiry { asset, quantity } => {
                 self.option_expiry(event, state, asset, *quantity, effects, run)
+            }
+            Action::ReturnOfCapital { asset, amount } => {
+                // A cash distribution of capital books its cash first.
+                self.apply_cash_only(event, state, run)?;
+                self.return_of_capital(event, state, asset, *amount, effects, run)
+            }
+            Action::NotionalDistribution { asset, amount } => {
+                self.notional_distribution(event, state, asset, *amount)
             }
         }
     }
@@ -1927,6 +1946,317 @@ impl Projector<'_> {
         Ok(())
     }
 
+    /// The position's long lots and their units after splits, spread over
+    /// which a cost basis adjustment moves every unit's cost alike (rules
+    /// R7.4), and the units held. `None` when the account holds no units of
+    /// the asset.
+    fn long_units(
+        state: &AccountState,
+        asset: &AssetId,
+    ) -> Option<(Vec<usize>, Vec<Decimal>, Decimal)> {
+        let position = state.positions.get(asset)?;
+        let held = positive_effective(position);
+        if !is_significant(held) {
+            return None;
+        }
+        let long: Vec<usize> = (0..position.lots.len())
+            .filter(|i| position.lots[*i].quantity > Decimal::ZERO)
+            .collect();
+        let units = long
+            .iter()
+            .map(|i| position.lots[*i].effective_quantity())
+            .collect();
+        Some((long, units, held))
+    }
+
+    /// An adjustment's amount (activity currency) in the position, account
+    /// and base currency: in the position's as a trade converts, in the
+    /// others as [`Self::adjustment_in`] does; `None` for a currency no rate
+    /// reaches. The position's own currency always takes the position amount.
+    fn adjustment_amounts(
+        &self,
+        event: &EconomicEvent,
+        state: &AccountState,
+        position_currency: &Currency,
+        amount: Decimal,
+    ) -> Result<(Decimal, Option<Decimal>, Option<Decimal>), String> {
+        let account_currency = &state.currency;
+        let (in_position, ..) = in_position_currency(
+            self.fx,
+            event,
+            [amount, Decimal::ZERO, Decimal::ZERO],
+            position_currency.as_str(),
+            account_currency.as_str(),
+        )?;
+        let in_target = |target: &str| {
+            if target == position_currency.as_str() {
+                Some(in_position)
+            } else {
+                self.adjustment_in(event, amount, target, account_currency)
+                    .ok()
+            }
+        };
+        Ok((
+            in_position,
+            in_target(account_currency.as_str()),
+            in_target(self.base()),
+        ))
+    }
+
+    /// RETURN_OF_CAPITAL (rules R7.4): capital paid back reduces the cost
+    /// basis as a disposal of no units would. Under WAC the lots pool first,
+    /// as for a sale, and the pool is the basis; otherwise each long lot
+    /// takes its units' share. The cost falls by the share in the position
+    /// currency, and the book cost by the share at the day's rate in the
+    /// account and base currency (the CRA converts the ACB at the rate in
+    /// effect when a return of capital is received); the purchase's price,
+    /// charges and acquisition rates stay. Within the basis nothing is
+    /// realized. Beyond it, in either currency, the basis goes to zero and
+    /// the excess is a capital gain, recorded as a disposal with no units.
+    /// With no units left, the whole amount is one, on the lot the last
+    /// disposal closed; an account that never held the asset rejects it.
+    fn return_of_capital(
+        &self,
+        event: &EconomicEvent,
+        state: &mut AccountState,
+        asset: &AssetId,
+        amount: Decimal,
+        effects: &mut SideEffects,
+        run: &mut RunLog,
+    ) -> Result<(), String> {
+        if amount.is_zero() {
+            return Err("a return of capital needs an amount".to_string());
+        }
+        let account = state.account.clone();
+        let account_currency = state.currency.clone();
+        let base = self.facts.policy.base_currency.clone();
+        if self.method(&account) == CostBasisMethod::Wac {
+            if let Some(position) = state.positions.get_mut(asset) {
+                self.pool_lots(&account, account_currency.as_str(), event, position, false)?;
+            }
+        }
+        let Some(position_currency) = state.positions.get(asset).map(|p| p.currency.clone()) else {
+            return Err(format!("return of capital of {asset} with no units held"));
+        };
+        let (in_position, in_account, in_base) =
+            self.adjustment_amounts(event, state, &position_currency, amount)?;
+        let disposal_rate = self
+            .fx
+            .rate(position_currency.as_str(), base.as_str(), event.date)
+            .unwrap_or(Decimal::ZERO);
+        if in_base.is_none() {
+            run.diagnostics.push(Diagnostic::warning(
+                DiagnosticCode::FxUnavailable,
+                event.source.as_str(),
+                "return of capital FX to base missing; base attribution recorded as zero",
+            ));
+        }
+        // A disposal with no units: the amount paid back and the basis it
+        // recovered.
+        let gain = |lot_id: &str,
+                    k: usize,
+                    proceeds: Decimal,
+                    proceeds_base: Option<Decimal>,
+                    [cost, cost_base]: [Decimal; 2]| {
+            let stored_proceeds = proceeds.round_dp(STORED_PRECISION);
+            let stored_cost = cost.round_dp(STORED_PRECISION);
+            let stored_proceeds_base = proceeds_base.unwrap_or_default().round_dp(STORED_PRECISION);
+            let stored_cost_base = cost_base.round_dp(STORED_PRECISION);
+            LotDisposal {
+                id: format!("{}:{lot_id}:{k}", event.id),
+                lot_id: lot_id.to_string(),
+                account: account.clone(),
+                asset: asset.clone(),
+                event: event.id.clone(),
+                date: event.date,
+                quantity: Decimal::ZERO,
+                proceeds: stored_proceeds,
+                cost_basis: stored_cost,
+                realized_pnl: (stored_proceeds - stored_cost).round_dp(STORED_PRECISION),
+                proceeds_base: stored_proceeds_base,
+                cost_basis_base: stored_cost_base,
+                realized_pnl_base: if proceeds_base.is_some() {
+                    (stored_proceeds_base - stored_cost_base).round_dp(STORED_PRECISION)
+                } else {
+                    Decimal::ZERO
+                },
+                currency: position_currency.clone(),
+                fx_rate_to_base: disposal_rate,
+            }
+        };
+
+        let Some((long, units, held)) = Self::long_units(state, asset) else {
+            let closed = state
+                .positions
+                .get(asset)
+                .and_then(|p| p.last_closed_lot.clone())
+                .ok_or_else(|| format!("return of capital of {asset} with no units held"))?;
+            effects.disposals.push(gain(
+                &closed,
+                0,
+                in_position,
+                in_base,
+                [Decimal::ZERO, Decimal::ZERO],
+            ));
+            return Ok(());
+        };
+        let spread =
+            |total: Option<Decimal>| total.map(|t| spread_by_units(t, &units, held)).transpose();
+        let shares = spread_by_units(in_position, &units, held)?;
+        let to_account = spread(in_account)?;
+        let to_base = spread(in_base)?;
+        let Some(position) = state.positions.get_mut(asset) else {
+            return Ok(());
+        };
+        for (k, &index) in long.iter().enumerate() {
+            let book = |target: &str| {
+                self.lot_book_cost(&position.lots[index], position_currency.as_str(), target)
+            };
+            let (book_account, book_base) = (book(account_currency.as_str()), book(base.as_str()));
+            let lot = &mut position.lots[index];
+            let cost = lot.cost_basis;
+            let share = shares[k];
+            let relieved = share.min(cost.max(Decimal::ZERO));
+            lot.cost_basis = cost - relieved;
+            // The book cost falls by the share at the day's rate, at most to
+            // zero; with no day's rate, in proportion to the cost.
+            let reduce = |book: Decimal, share: Option<Decimal>| match share {
+                Some(share) => share.min(book.max(Decimal::ZERO)),
+                None if cost.is_zero() => Decimal::ZERO,
+                None => proportional(book, relieved, cost).unwrap_or(book),
+            };
+            let account_share = to_account.as_ref().map(|s| s[k]);
+            let base_share = to_base.as_ref().map(|s| s[k]);
+            if let Some(book) = book_account {
+                let relieved_account = reduce(book, account_share);
+                store_book_cost(
+                    lot,
+                    &account_currency,
+                    &position_currency,
+                    true,
+                    book - relieved_account,
+                );
+            }
+            let relieved_base = book_base.map(|book| {
+                let relieved_base = reduce(book, base_share);
+                store_book_cost(lot, &base, &position_currency, false, book - relieved_base);
+                relieved_base
+            });
+            let realized = share - relieved;
+            let realized_base = match (base_share, relieved_base) {
+                (Some(share), Some(relieved)) => share - relieved,
+                _ => Decimal::ZERO,
+            };
+            if realized.round_dp(STORED_PRECISION).is_zero()
+                && realized_base.round_dp(STORED_PRECISION).is_zero()
+            {
+                continue;
+            }
+            effects.disposals.push(gain(
+                &lot.id,
+                k,
+                share,
+                base_share,
+                [relieved, relieved_base.unwrap_or_default()],
+            ));
+        }
+        let allows_negative = position.lots.iter().any(|l| l.quantity < Decimal::ZERO);
+        recalculate_aggregates(position, allows_negative)
+    }
+
+    /// NOTIONAL_DISTRIBUTION (rules R7.4): a taxable distribution reinvested
+    /// without new units adds to the cost basis as a purchase of no units
+    /// would, without pooling WAC lots (a purchase does not). Each long lot
+    /// takes its units' share: its cost rises by it in the position
+    /// currency and its book cost by it at the day's rate in the account and
+    /// base currency; the purchase's price, charges and acquisition rates
+    /// stay.
+    fn notional_distribution(
+        &self,
+        event: &EconomicEvent,
+        state: &mut AccountState,
+        asset: &AssetId,
+        amount: Decimal,
+    ) -> Result<(), String> {
+        if amount.is_zero() {
+            return Err("a notional distribution needs an amount".to_string());
+        }
+        let Some((long, units, held)) = Self::long_units(state, asset) else {
+            return Err(format!(
+                "notional distribution of {asset} with no units held"
+            ));
+        };
+        let account_currency = state.currency.clone();
+        let base = self.facts.policy.base_currency.clone();
+        let Some(position_currency) = state.positions.get(asset).map(|p| p.currency.clone()) else {
+            return Ok(());
+        };
+        let (in_position, in_account, in_base) =
+            self.adjustment_amounts(event, state, &position_currency, amount)?;
+        let missing = |target: &Currency| {
+            format!(
+                "no {}->{} rate on {}",
+                event.currency.as_str(),
+                target.as_str(),
+                event.date
+            )
+        };
+        let in_account = in_account.ok_or_else(|| missing(&account_currency))?;
+        let in_base = in_base.ok_or_else(|| missing(&base))?;
+        let shares = spread_by_units(in_position, &units, held)?;
+        let to_account = spread_by_units(in_account, &units, held)?;
+        let to_base = spread_by_units(in_base, &units, held)?;
+        let Some(position) = state.positions.get_mut(asset) else {
+            return Ok(());
+        };
+        for (k, &index) in long.iter().enumerate() {
+            let book = |target: &str| {
+                self.lot_book_cost(&position.lots[index], position_currency.as_str(), target)
+            };
+            let (book_account, book_base) = (book(account_currency.as_str()), book(base.as_str()));
+            let lot = &mut position.lots[index];
+            lot.cost_basis += shares[k];
+            if let Some(book) = book_account {
+                store_book_cost(
+                    lot,
+                    &account_currency,
+                    &position_currency,
+                    true,
+                    book + to_account[k],
+                );
+            }
+            if let Some(book) = book_base {
+                store_book_cost(lot, &base, &position_currency, false, book + to_base[k]);
+            }
+        }
+        let allows_negative = position.lots.iter().any(|l| l.quantity < Decimal::ZERO);
+        recalculate_aggregates(position, allows_negative)
+    }
+
+    /// A notional distribution's amount in `target`: as recorded in its own
+    /// currency, at the activity's rate in the account's, else at the day's
+    /// rate.
+    fn adjustment_in(
+        &self,
+        event: &EconomicEvent,
+        amount: Decimal,
+        target: &str,
+        account_currency: &Currency,
+    ) -> Result<Decimal, String> {
+        let from = event.currency.as_str();
+        if from == target {
+            return Ok(amount);
+        }
+        if target == account_currency.as_str() {
+            if let Some(rate) = event.fx_rate {
+                return checked(arith::mul(amount, rate), "adjustment at the supplied rate");
+            }
+        }
+        self.fx
+            .convert(amount, from, target, event.date)
+            .ok_or_else(|| format!("no {from}->{target} rate on {}", event.date))
+    }
+
     // ------------------------------------------------------------- helpers
 
     fn position_mut<'s>(
@@ -1957,6 +2287,7 @@ impl Projector<'_> {
                 inception: when,
                 cost_basis_account: None,
                 cost_basis_base: None,
+                last_closed_lot: None,
             })
     }
 
@@ -2129,7 +2460,13 @@ impl Projector<'_> {
         run: &mut RunLog,
     ) -> Decimal {
         lots.iter()
-            .filter(|lot| !lot.quantity.is_zero() && !lot.cost_basis.is_zero())
+            .filter(|lot| {
+                !lot.quantity.is_zero()
+                    && (!lot.cost_basis.is_zero()
+                        || lot
+                            .stored_book_cost_in(target)
+                            .is_some_and(|book| !book.is_zero()))
+            })
             .map(|lot| {
                 self.lot_cost_basis_in(lot, position_currency, target, fallback_date, event, run)
             })
@@ -2176,12 +2513,16 @@ impl Projector<'_> {
         }
     }
 
-    /// A lot's book cost in `target`: its cost at the lot's stored rate to
-    /// `target`, else at its acquisition date's rate (the resolver applies
-    /// minor units). `None` when no rate converts it.
+    /// A lot's book cost in `target`: what a cost basis adjustment stored
+    /// (rules R7.4), else its cost at the lot's stored rate to `target`, else
+    /// at its acquisition date's rate (the resolver applies minor units).
+    /// `None` when no rate converts it.
     fn lot_book_cost(&self, lot: &Lot, position_currency: &str, target: &str) -> Option<Decimal> {
         if position_currency == target {
             return Some(lot.cost_basis);
+        }
+        if let Some(book) = lot.stored_book_cost_in(target) {
+            return Some(book);
         }
         lot.stored_fx_rate_to(target)
             .and_then(|rate| arith::mul(lot.cost_basis, rate))
@@ -2360,6 +2701,12 @@ impl Projector<'_> {
             let share = |total: Decimal, what: &str| {
                 checked(arith::proportional(total, effective, total_quantity), what)
             };
+            // The slice's book cost: as adjustments stored it (rules R7.4),
+            // else at the lot's acquisition rate.
+            let cost_basis_base = match lot.stored_book_cost_in(self.base()) {
+                Some(book) => Some(book),
+                None => at_acquisition_rate(cost_basis)?,
+            };
             // Each side in base is recorded when its rate is known, whatever
             // the other's; realized P&L in base needs both (rules R3.4).
             let (proceeds, proceeds_base) = match proceeds {
@@ -2375,9 +2722,8 @@ impl Projector<'_> {
                     };
                     (proceeds, proceeds_base)
                 }
-                Proceeds::AtCost => (cost_basis, at_acquisition_rate(cost_basis)?),
+                Proceeds::AtCost => (cost_basis, cost_basis_base),
             };
-            let cost_basis_base = at_acquisition_rate(cost_basis)?;
             let stored_proceeds = proceeds.round_dp(STORED_PRECISION);
             let stored_cost = cost_basis.round_dp(STORED_PRECISION);
             let stored_proceeds_base = proceeds_base.unwrap_or_default().round_dp(STORED_PRECISION);
@@ -2411,15 +2757,17 @@ impl Projector<'_> {
         Ok(())
     }
 
-    /// The lots' cost in base at the rates they were acquired at; `None`
-    /// when one has no rate.
+    /// The lots' book cost in base (their cost at the rates they were
+    /// acquired at, as adjustments moved it); `None` when one has no rate.
     fn historical_base_cost(&self, lots: &[Lot], position_currency: &str) -> Option<Decimal> {
         lots.iter()
             .map(|lot| {
-                let rate = self.lot_rate_to_base(lot, position_currency);
-                (!rate.is_zero())
-                    .then(|| arith::mul(lot.cost_basis, rate))
-                    .flatten()
+                lot.stored_book_cost_in(self.base()).or_else(|| {
+                    let rate = self.lot_rate_to_base(lot, position_currency);
+                    (!rate.is_zero())
+                        .then(|| arith::mul(lot.cost_basis, rate))
+                        .flatten()
+                })
             })
             .sum()
     }
@@ -2593,6 +2941,62 @@ fn capitalize_fee(
     recalculate_aggregates(position, allows_negative)
 }
 
+/// `total` shared over lots holding `units` of `held` effective units; the
+/// last takes what rounding left, so the shares sum to `total` exactly.
+fn spread_by_units(
+    total: Decimal,
+    units: &[Decimal],
+    held: Decimal,
+) -> Result<Vec<Decimal>, String> {
+    let mut shares = Vec::with_capacity(units.len());
+    let mut remaining = total;
+    for (k, &part) in units.iter().enumerate() {
+        let share = if k + 1 == units.len() {
+            remaining
+        } else {
+            proportional(total, part, held)?
+        };
+        remaining -= share;
+        shares.push(share);
+    }
+    Ok(shares)
+}
+
+/// Stores `book` as `lot`'s book cost in `target`, the account's
+/// (`account_slot`) or the base currency (rules R7.4); nothing for the
+/// position's own currency, where the book cost is the cost. A rate the lot
+/// stored in that slot for another currency (one transferred from an account
+/// in another currency) no longer applies.
+fn store_book_cost(
+    lot: &mut Lot,
+    target: &Currency,
+    position_currency: &Currency,
+    account_slot: bool,
+    book: Decimal,
+) {
+    if target == position_currency {
+        return;
+    }
+    let (currency, rate, slot) = if account_slot {
+        (
+            &mut lot.account_currency,
+            &mut lot.fx_rate_to_account,
+            &mut lot.book_cost_account,
+        )
+    } else {
+        (
+            &mut lot.base_currency,
+            &mut lot.fx_rate_to_base,
+            &mut lot.book_cost_base,
+        )
+    };
+    if currency.as_ref() != Some(target) {
+        *rate = None;
+        *currency = Some(target.clone());
+    }
+    *slot = Some(book);
+}
+
 fn add_fee(lot: &mut Lot, fee: Decimal) {
     lot.cost_basis += fee;
     lot.fees += fee;
@@ -2694,6 +3098,8 @@ fn new_lot(
         base_currency: book.base_currency.clone(),
         source_event: Some(event.id.clone()),
         split_ratio: Decimal::ONE,
+        book_cost_account: None,
+        book_cost_base: None,
     })
 }
 
@@ -2785,6 +3191,8 @@ fn add_transferred_lots(
             base_currency: source.base_currency.clone(),
             source_event: Some(EventId::new(prefix)),
             split_ratio: source.split_ratio,
+            book_cost_account: source.book_cost_account,
+            book_cost_base: source.book_cost_base,
         };
         total += lot.cost_basis;
         position.lots.push(lot);
@@ -2910,6 +3318,8 @@ fn relieve(
         let basis_removed = lot.cost_basis * share;
         let fees_removed = lot.fees * share;
         let taxes_removed = lot.taxes * share;
+        let book_account_removed = lot.book_cost_account.map(|book| book * share);
+        let book_base_removed = lot.book_cost_base.map(|book| book * share);
         let removed_signed = if negative {
             -acquired_abs
         } else {
@@ -2939,6 +3349,8 @@ fn relieve(
                 base_currency: lot.base_currency.clone(),
                 source_event: lot.source_event.clone(),
                 split_ratio: ratio,
+                book_cost_account: book_account_removed,
+                book_cost_base: book_base_removed,
             });
         }
         quantity_reduced += consume;
@@ -2956,8 +3368,19 @@ fn relieve(
             lot.cost_basis -= basis_removed;
             lot.fees -= fees_removed;
             lot.taxes -= taxes_removed;
+            lot.book_cost_account = lot
+                .book_cost_account
+                .zip(book_account_removed)
+                .map(|(book, removed)| book - removed);
+            lot.book_cost_base = lot
+                .book_cost_base
+                .zip(book_base_removed)
+                .map(|(book, removed)| book - removed);
             keep.push(lot);
         }
+    }
+    if let Some(closed) = fully_consumed.last() {
+        position.last_closed_lot = Some(closed.id.clone());
     }
     position.lots = keep;
     let allows_negative = negative || position.lots.iter().any(|l| l.quantity < Decimal::ZERO);
@@ -3141,7 +3564,11 @@ pub fn lot_records(
                         original_cost_basis,
                         remaining_cost_basis: lot.cost_basis,
                         original_cost_basis_base: at_rate(original_cost_basis),
-                        remaining_cost_basis_base: at_rate(lot.cost_basis),
+                        // The purchase converts at its acquisition rate; what
+                        // is left, as adjustments moved it (rules R7.4).
+                        remaining_cost_basis_base: lot
+                            .stored_book_cost_in(base)
+                            .unwrap_or_else(|| at_rate(lot.cost_basis)),
                         fee_allocated: fees,
                         fee_allocated_base: at_rate(fees),
                         tax_allocated: taxes,

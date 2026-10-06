@@ -1579,6 +1579,7 @@ fn priced_events(
                         direction: Direction::In,
                         ..
                     }
+                    | Action::ReturnOfCapital { .. }
             ),
             trade_charge,
             marked_external: marked_external.contains(event.source.as_str()),

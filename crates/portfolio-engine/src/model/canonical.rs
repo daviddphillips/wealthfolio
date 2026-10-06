@@ -168,7 +168,7 @@ impl ActivityKind {
     }
 }
 
-/// The 10 canonical subtypes (broker aliases collapse onto these).
+/// The 12 canonical subtypes (broker aliases collapse onto these).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum Subtype {
@@ -182,6 +182,12 @@ pub enum Subtype {
     OptionExpiry,
     PositionOpen,
     PositionClose,
+    /// Capital paid back, not income: on a DIVIDEND or an ADJUSTMENT, lowers
+    /// the asset's cost basis (rules R7.4).
+    ReturnOfCapital,
+    /// On an ADJUSTMENT: a taxable distribution reinvested without new
+    /// units, which raises the asset's cost basis (rules R7.4).
+    NotionalDistribution,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

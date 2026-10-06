@@ -677,6 +677,8 @@ fn canonical_subtype(
         "OPTION_EXPIRY" => Some(Subtype::OptionExpiry),
         "POSITION_OPEN" => Some(Subtype::PositionOpen),
         "POSITION_CLOSE" => Some(Subtype::PositionClose),
+        "RETURN_OF_CAPITAL" => Some(Subtype::ReturnOfCapital),
+        "NOTIONAL_DISTRIBUTION" => Some(Subtype::NotionalDistribution),
         _ => None,
     };
     if shared.is_none() {

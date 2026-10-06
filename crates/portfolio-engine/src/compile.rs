@@ -1,5 +1,5 @@
 //! Stage 2: the single economics authority. Total over the 14-type ×
-//! 10-subtype vocabulary: every posted activity maps to one or two events
+//! 12-subtype vocabulary: every posted activity maps to one or two events
 //! (composites expand) or to a diagnostic. Cash resolution follows the
 //! final-cash contract: the stored `amount` is authoritative, never derived.
 
@@ -353,6 +353,26 @@ fn action_for(activity: &Activity, diagnostics: &mut Vec<Diagnostic>) -> Action 
                 quantity: activity.quantity,
             }
         }
+        (Adjustment, Some(asset)) if activity.subtype == Some(Subtype::ReturnOfCapital) => {
+            Action::ReturnOfCapital {
+                asset,
+                amount: activity.amount.unwrap_or_default().abs(),
+            }
+        }
+        (Adjustment, Some(asset)) if activity.subtype == Some(Subtype::NotionalDistribution) => {
+            Action::NotionalDistribution {
+                asset,
+                amount: activity.amount.unwrap_or_default().abs(),
+            }
+        }
+        // A distribution of capital: its gross amount, the cash plus what was
+        // withheld from it, is cost recovered.
+        (Dividend, Some(asset)) if activity.subtype == Some(Subtype::ReturnOfCapital) => {
+            Action::ReturnOfCapital {
+                asset,
+                amount: activity.amount.unwrap_or_default().abs() + activity.fee + activity.tax,
+            }
+        }
         _ => Action::None,
     }
 }
@@ -369,6 +389,12 @@ fn attribution_for(activity: &Activity, account: &AccountFacts) -> Attributed {
     match activity.kind {
         Interest if account.kind == AccountKind::CreditCard => Attributed {
             fee: amount,
+            ..Attributed::default()
+        },
+        // Capital paid back, not income; what was withheld is still a charge.
+        Dividend if activity.subtype == Some(Subtype::ReturnOfCapital) => Attributed {
+            fee,
+            tax,
             ..Attributed::default()
         },
         Dividend | Interest => Attributed {
@@ -399,6 +425,18 @@ fn attribution_for(activity: &Activity, account: &AccountFacts) -> Attributed {
         },
         TransferIn | TransferOut if !activity.is_security_transfer => Attributed {
             tax,
+            ..Attributed::default()
+        },
+        // Each moves income by what it moves cost, so the unrealized P&L the
+        // cost change causes is no gain (rules R7.4): a return of capital
+        // takes capital back out of dividends already counted as income; a
+        // notional distribution is income reinvested as cost.
+        Adjustment if activity.subtype == Some(Subtype::ReturnOfCapital) => Attributed {
+            income: -amount.abs(),
+            ..Attributed::default()
+        },
+        Adjustment if activity.subtype == Some(Subtype::NotionalDistribution) => Attributed {
+            income: amount.abs(),
             ..Attributed::default()
         },
         _ => Attributed::default(),

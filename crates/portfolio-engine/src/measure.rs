@@ -1732,9 +1732,10 @@ fn activity_effects(
 }
 
 /// Disposals of the period whose disposing event realizes (a trade, an
-/// option's expiry, or units a transfer delivered into a short) and is dated
-/// inside the period. The previous calculator kept trades only, which left
-/// out the P&L of an expiry or a transfer cover.
+/// option's expiry, units a transfer delivered into a short, or a return of
+/// capital, rules R7.4) and is dated inside the period. The previous
+/// calculator kept trades only, which left out the P&L of an expiry or a
+/// transfer cover.
 fn period_disposals<'a>(
     inputs: &'a MeasureInputs<'a>,
     result: &PerformanceResult,
