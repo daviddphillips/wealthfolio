@@ -102,10 +102,33 @@ pub(super) fn plan(
             .map(|(id, day)| (id.as_str().to_string(), day))
             .collect()
     };
-    Plan {
+    let mut plan = Plan {
         refold: of_targets(impact.refold),
         revalue: of_targets(impact.revalue),
+    };
+    // A transactions account without activities has nothing to fold or price:
+    // a run writes its empty state as one row, on the last day. Revaluing it
+    // would clear that row and price nothing in its place, and rewriting it
+    // from a later day would leave the old row behind, so any change refolds
+    // it whole.
+    let with_activities: BTreeSet<&str> = facts
+        .activities()
+        .iter()
+        .map(|a| a.account.as_str())
+        .collect();
+    for (id, account) in facts.accounts() {
+        let id = id.as_str();
+        if account.tracking == TrackingMode::Holdings
+            || with_activities.contains(id)
+            || !targets.contains(id)
+        {
+            continue;
+        }
+        if plan.revalue.remove(id).is_some() || plan.refold.contains_key(id) {
+            plan.refold.insert(id.to_string(), GENESIS);
+        }
     }
+    plan
 }
 
 /// The change of facts a marker records.
