@@ -778,7 +778,7 @@ itself remains in this repository's history.
 
 ## Appendix A — Activity vocabulary
 
-The compile stage is total over this vocabulary: 14 activity types, 10 canonical
+The compile stage is total over this vocabulary: 14 activity types, 12 canonical
 subtypes with broker-alias canonicalisation (BTO, BTC, STO, STC, SELL_SHORT and
 BUY_TO_COVER map onto POSITION_OPEN and POSITION_CLOSE), and 4 statuses, of
 which only `Posted` computes. An `activity_type_override` wins everywhere.
@@ -797,7 +797,7 @@ effect.
 | ------------ | ------------------------------------------------------------------------------------------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------ |
 | BUY          | − amount; gross = amount − charges                                                                                              | + qty; opens a lot (basis = gross + charges); a short cover uses POSITION_CLOSE intent with cash prorated to the covered quantity                                                                                                                                                             | —                                                        | Internal                                                                                                                       |
 | SELL         | + amount; − amount when charges exceed proceeds and the derivation reproduces the stored amount within tolerance (NOM-TRADE-05) | − qty; closes lots by the account's method (rules §7) with realised P&L; a short open uses POSITION_OPEN intent (negative lot); a sell with no position is cash only + warning; units beyond the position realise no proceeds + warning                                                       | —                                                        | Internal                                                                                                                       |
-| DIVIDEND     | + amount                                                                                                                        | — (DRIP and dividend-in-kind expand into two legs first)                                                                                                                                                                                                                                      | —                                                        | Internal                                                                                                                       |
+| DIVIDEND     | + amount                                                                                                                        | — (DRIP and dividend-in-kind expand into two legs first); RETURN_OF_CAPITAL: recovers its gross amount of cost, beyond it a capital gain (rules R7.4)                                                                                                                                         | —                                                        | Internal                                                                                                                       |
 | INTEREST     | + amount; on credit-card accounts − amount (EDGE-CC-01)                                                                         | — (staking rewards expand)                                                                                                                                                                                                                                                                    | —                                                        | Internal                                                                                                                       |
 | DEPOSIT      | + amount                                                                                                                        | —                                                                                                                                                                                                                                                                                             | **+ amount**                                             | **External**                                                                                                                   |
 | WITHDRAWAL   | − amount; gross = amount − charges                                                                                              | —                                                                                                                                                                                                                                                                                             | **− amount**                                             | **External**                                                                                                                   |
@@ -807,15 +807,17 @@ effect.
 | TAX          | − amount                                                                                                                        | —                                                                                                                                                                                                                                                                                             | —                                                        | Internal                                                                                                                       |
 | SPLIT        | **none**                                                                                                                        | multiplies the split ratio of lots acquired before the split's local date; ratio from amount, else quantity; a fractional cashout is a separate sell                                                                                                                                          | —                                                        | Internal                                                                                                                       |
 | CREDIT       | + amount                                                                                                                        | —                                                                                                                                                                                                                                                                                             | **+ amount only for subtype BONUS**                      | External for BONUS, else Internal                                                                                              |
-| ADJUSTMENT   | none                                                                                                                            | OPTION_EXPIRY: removal by the account's method at zero proceeds (basis becomes a realised loss); other subtypes are no-ops                                                                                                                                                                    | —                                                        | Internal                                                                                                                       |
+| ADJUSTMENT   | none                                                                                                                            | OPTION_EXPIRY: removal by the account's method at zero proceeds (basis becomes a realised loss); RETURN_OF_CAPITAL: recovers its amount of cost, beyond it a capital gain; NOTIONAL_DISTRIBUTION: adds its amount to cost (rules R7.4); other subtypes are no-ops                             | —                                                        | Internal                                                                                                                       |
 | UNKNOWN      | none                                                                                                                            | none (warn and skip)                                                                                                                                                                                                                                                                          | —                                                        | Internal                                                                                                                       |
 
 **Subtypes.** `DRIP` (dividend into two legs), `STAKING_REWARD` (interest into
 two legs), `DIVIDEND_IN_KIND` (two legs), `BONUS`, `REBATE`, `REFUND` and
 `REIMBURSEMENT` (credit variants, of which only BONUS is external capital),
-`OPTION_EXPIRY`, and `POSITION_OPEN` / `POSITION_CLOSE` (trade intent). A
-two-leg expansion puts the income leg first and carries fee and tax there; the
-buy leg carries the income as its amount, so net cash is about zero, with price
+`OPTION_EXPIRY`, `RETURN_OF_CAPITAL` (a dividend or adjustment of capital) and
+`NOTIONAL_DISTRIBUTION` (an adjustment for a distribution reinvested without
+units), and `POSITION_OPEN` / `POSITION_CLOSE` (trade intent). A two-leg
+expansion puts the income leg first and carries fee and tax there; the buy leg
+carries the income as its amount, so net cash is about zero, with price
 precedence: explicit positive unit price, then amount over quantity, then the
 raw unit price.
 
@@ -823,15 +825,17 @@ raw unit price.
 it on the event (`EconomicEvent::attribution`); `measure` never re-reads the
 activity. A window attributes the events after its start row; an all-time
 (inception) window, whose change runs from zero, also counts the first day's.
-Income attribution is gross. Fees and taxes are attributed for trades, income
-and standalone charge rows; fees on deposits, withdrawals and transfers are
-booked to cash but knowingly not attributed. Credit-card interest is a charge on
-a liability, so its amount is attributed as a fee, never as income (EDGE-CC-01).
-Shortability: options may go negative implicitly, equities require explicit
-intent, everything else rejects a negative lot. Cash books into the account
-currency at the supplied rate when the activity carries one and the currencies
-differ, otherwise into the activity-currency bucket; an empty currency is a
-diagnostic, never a bucket key.
+Income attribution is gross. A dividend of capital is no income; a return of
+capital adjustment is negative income and a notional distribution positive
+income, each by its amount (rules R7.4). Fees and taxes are attributed for
+trades, income and standalone charge rows; fees on deposits, withdrawals and
+transfers are booked to cash but knowingly not attributed. Credit-card interest
+is a charge on a liability, so its amount is attributed as a fee, never as
+income (EDGE-CC-01). Shortability: options may go negative implicitly, equities
+require explicit intent, everything else rejects a negative lot. Cash books into
+the account currency at the supplied rate when the activity carries one and the
+currencies differ, otherwise into the activity-currency bucket; an empty
+currency is a diagnostic, never a bucket key.
 
 ## Glossary
 
