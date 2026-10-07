@@ -1645,7 +1645,7 @@ impl Projector<'_> {
             .1
         };
         if !paired && !fee.is_zero() {
-            capitalize_fee(position, &event.id, fee, info.allows_negative_lots)?;
+            capitalize_fee(position, &event.id, fee, info.allows_negative_lots, self.fx)?;
         }
         let added_lots: Vec<Lot> = position
             .lots
@@ -1750,7 +1750,7 @@ impl Projector<'_> {
 
         if paired && !fee.is_zero() {
             if let Some(position) = state.positions.get_mut(asset) {
-                capitalize_fee(position, &event.id, fee, info.allows_negative_lots)?;
+                capitalize_fee(position, &event.id, fee, info.allows_negative_lots, self.fx)?;
             }
         }
         Ok(())
@@ -2004,10 +2004,10 @@ impl Projector<'_> {
     }
 
     /// RETURN_OF_CAPITAL (rules R7.4): capital paid back reduces the cost
-    /// basis as a disposal of no units would. Under WAC the lots pool first,
-    /// as for a sale, and the pool is the basis; otherwise each long lot
-    /// takes its units' share. The cost falls by the share in the position
-    /// currency, and the book cost by the share at the day's rate in the
+    /// basis as a disposal of no units would. Under WAC all long lots form
+    /// one basis pool, even when their provenance keeps them separate;
+    /// otherwise each long lot takes its units' share. Each currency's
+    /// combined cost falls by the amount at the distribution day's rate in the
     /// account and base currency (the CRA converts the ACB at the rate in
     /// effect when a return of capital is received); the purchase's price,
     /// charges and acquisition rates stay. Within the basis nothing is
@@ -2100,11 +2100,38 @@ impl Projector<'_> {
             ));
             return Ok(());
         };
-        let spread =
-            |total: Option<Decimal>| total.map(|t| spread_by_units(t, &units, held)).transpose();
-        let shares = spread_by_units(in_position, &units, held)?;
-        let to_account = spread(in_account)?;
-        let to_base = spread(in_base)?;
+        // Some WAC lots must stay apart to preserve transfer and split
+        // history. Their basis is still one pool: recover it by cost, then
+        // spread only the excess by units. Each currency has its own pool.
+        let position = &state.positions[asset];
+        let spread = |total: Decimal, target: &str| {
+            if self.method(&account) == CostBasisMethod::Wac {
+                let costs: Option<Vec<_>> = long
+                    .iter()
+                    .map(|&index| {
+                        self.lot_book_cost(
+                            &position.lots[index],
+                            position_currency.as_str(),
+                            target,
+                        )
+                        .map(|cost| cost.max(Decimal::ZERO))
+                    })
+                    .collect();
+                if let Some(costs) = costs {
+                    return spread_return_of_capital(total, &costs, &units, held);
+                }
+            }
+            // Without a complete pool in this currency, keep the existing
+            // per-lot fallback and its missing-FX diagnostics.
+            spread_by_units(total, &units, held)
+        };
+        let shares = spread(in_position, position_currency.as_str())?;
+        let to_account = in_account
+            .map(|total| spread(total, account_currency.as_str()))
+            .transpose()?;
+        let to_base = in_base
+            .map(|total| spread(total, base.as_str()))
+            .transpose()?;
         let Some(position) = state.positions.get_mut(asset) else {
             return Ok(());
         };
@@ -2546,7 +2573,13 @@ impl Projector<'_> {
         position
             .lots
             .iter()
-            .filter(|lot| !lot.quantity.is_zero() && !lot.cost_basis.is_zero())
+            .filter(|lot| {
+                !lot.quantity.is_zero()
+                    && (!lot.cost_basis.is_zero()
+                        || lot
+                            .stored_book_cost_in(target)
+                            .is_some_and(|book| !book.is_zero()))
+            })
             .map(|lot| self.lot_book_cost(lot, position.currency.as_str(), target))
             .sum()
     }
@@ -2919,6 +2952,7 @@ fn capitalize_fee(
     event: &EventId,
     fee: Decimal,
     allows_negative: bool,
+    fx: &FxResolver<'_>,
 ) -> Result<(), String> {
     let delivered: Vec<usize> = (0..position.lots.len())
         .filter(|i| position.lots[*i].source_event.as_ref() == Some(event))
@@ -2934,10 +2968,15 @@ fn capitalize_fee(
     for &index in rest {
         let lot = &mut position.lots[index];
         let share = proportional(fee, lot.effective_quantity().abs(), total)?;
-        add_fee(lot, share);
+        add_fee(lot, share, position.currency.as_str(), fx)?;
         remaining -= share;
     }
-    add_fee(&mut position.lots[last], remaining);
+    add_fee(
+        &mut position.lots[last],
+        remaining,
+        position.currency.as_str(),
+        fx,
+    )?;
     recalculate_aggregates(position, allows_negative)
 }
 
@@ -2960,6 +2999,27 @@ fn spread_by_units(
         shares.push(share);
     }
     Ok(shares)
+}
+
+/// A WAC return of capital recovers the position's combined basis, even
+/// when its lots cannot merge. Only the amount beyond that pool realizes;
+/// it is allocated by units. Lot ids and acquisition facts stay intact.
+fn spread_return_of_capital(
+    total: Decimal,
+    costs: &[Decimal],
+    units: &[Decimal],
+    held: Decimal,
+) -> Result<Vec<Decimal>, String> {
+    let basis: Decimal = costs.iter().sum();
+    if total < basis {
+        return spread_by_units(total, costs, basis);
+    }
+    let excess = spread_by_units(total - basis, units, held)?;
+    Ok(costs
+        .iter()
+        .zip(excess)
+        .map(|(cost, gain)| cost + gain)
+        .collect())
 }
 
 /// Stores `book` as `lot`'s book cost in `target`, the account's
@@ -2997,10 +3057,45 @@ fn store_book_cost(
     *slot = Some(book);
 }
 
-fn add_fee(lot: &mut Lot, fee: Decimal) {
+fn add_fee(
+    lot: &mut Lot,
+    fee: Decimal,
+    position_currency: &str,
+    fx: &FxResolver<'_>,
+) -> Result<(), String> {
+    if fee.is_zero() {
+        return Ok(());
+    }
+    // Transfer fees retain the existing acquisition-FX policy (R2.4).
+    // Explicit book costs bypass cost × rate, so update those amounts too.
+    let fee_in = |currency: &Option<Currency>, rate: Option<Decimal>| {
+        let target = currency.as_ref().ok_or("book cost has no currency")?;
+        rate.filter(|rate| !rate.is_zero())
+            .and_then(|rate| arith::mul(fee, rate))
+            .or_else(|| {
+                fx.convert(
+                    fee,
+                    position_currency,
+                    target.as_str(),
+                    lot.acquisition_date,
+                )
+            })
+            .ok_or_else(|| format!("no acquisition rate for transfer fee to {target}"))
+    };
+    let in_account = lot
+        .book_cost_account
+        .map(|book| fee_in(&lot.account_currency, lot.fx_rate_to_account).map(|fee| book + fee))
+        .transpose()?;
+    let in_base = lot
+        .book_cost_base
+        .map(|book| fee_in(&lot.base_currency, lot.fx_rate_to_base).map(|fee| book + fee))
+        .transpose()?;
     lot.cost_basis += fee;
     lot.fees += fee;
     lot.original_fees += fee;
+    lot.book_cost_account = in_account;
+    lot.book_cost_base = in_base;
+    Ok(())
 }
 
 fn positive_effective(position: &Position) -> Decimal {
@@ -3236,6 +3331,8 @@ fn split_lots_by_cover(lots: &[Lot], taken: &[Decimal]) -> Result<(Vec<Lot>, Vec
         cover_lot.original_fees = cover_lot.fees;
         cover_lot.taxes = lot.taxes * fraction;
         cover_lot.original_taxes = cover_lot.taxes;
+        cover_lot.book_cost_account = lot.book_cost_account.map(|book| book * fraction);
+        cover_lot.book_cost_base = lot.book_cost_base.map(|book| book * fraction);
         let mut residual_lot = lot.clone();
         residual_lot.quantity = lot.quantity - consumed_signed;
         residual_lot.original_quantity = residual_lot.quantity;
@@ -3244,6 +3341,14 @@ fn split_lots_by_cover(lots: &[Lot], taken: &[Decimal]) -> Result<(Vec<Lot>, Vec
         residual_lot.original_fees = residual_lot.fees;
         residual_lot.taxes = lot.taxes - cover_lot.taxes;
         residual_lot.original_taxes = residual_lot.taxes;
+        residual_lot.book_cost_account = lot
+            .book_cost_account
+            .zip(cover_lot.book_cost_account)
+            .map(|(book, covered)| book - covered);
+        residual_lot.book_cost_base = lot
+            .book_cost_base
+            .zip(cover_lot.book_cost_base)
+            .map(|(book, covered)| book - covered);
         cover.push(cover_lot);
         residual.push(residual_lot);
     }

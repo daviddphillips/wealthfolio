@@ -516,17 +516,21 @@ currency).
 
 ### Return of Capital and Notional Distributions
 
-A **return of capital** pays back part of your own capital rather than income.
-It reduces the asset's cost basis (its adjusted cost base), and once that
-reaches zero the rest is a capital gain: the CRA deems a negative adjusted cost
-base a capital gain, and the IRS treats nondividend distributions beyond basis
-the same way. A **notional distribution** is a taxable distribution reinvested
-without new units: the fund issues units and consolidates them at once, so you
-keep the same number. Fund companies also call it a phantom, non-cash or
-reinvested distribution. It is income, and it raises the cost basis by its
-amount. A T3 slip reports both in box 42, "amount resulting in cost base
-adjustment": positive for a return of capital, negative for a notional
-distribution.
+These activities track book cost and investment performance within an account,
+using its selected cost basis method. Enter the classification supplied by your
+broker or fund. They do not calculate country-specific taxes or establish that
+the selected method is valid for your tax return.
+
+A **return of capital** pays back part of your investment and reduces book cost.
+Any amount beyond the remaining basis is recorded as realized P&L. A **notional
+distribution** records income reinvested without additional units, increasing
+both income and book cost by the entered amount. It is sometimes called a
+phantom or reinvested distribution. This subtype is not a general basis
+correction and does not cover every non-cash tax event.
+
+For Canadian funds, T3 box 42 reports cost-base adjustments: positive amounts
+reduce ACB and negative amounts increase it. The table below shows how to record
+a ROC reclassification or a reinvested distribution matching those effects.
 
 | Record as                               | When                                                                    | Cash   | Cost basis               | Income           |
 | --------------------------------------- | ----------------------------------------------------------------------- | ------ | ------------------------ | ---------------- |
@@ -536,18 +540,20 @@ distribution.
 
 - The amount moves the cost basis your account's cost basis method keeps. With
   weighted average cost, a return of capital reduces the pool, as a sale does,
-  so the average falls by the amount per unit. With FIFO, LIFO or HIFO, the
-  amount is spread over the lots by units, so every unit's cost moves alike.
-  Each lot's purchase price and fees stay as bought: what moves is its remaining
-  cost basis.
-- Beyond the remaining cost basis, a return of capital is a realized capital
-  gain, shown as a disposal with no units. One paid after you sold every unit is
-  a capital gain in full, on the lot the sale closed, and its cash is booked.
+  so nothing is realized while the combined basis covers the amount, even when
+  transfer history keeps some lots separate. With FIFO, LIFO or HIFO, the amount
+  is spread over the lots by units, so every unit's cost moves alike. Each lot's
+  purchase price and fees stay as bought: what moves is its remaining cost
+  basis.
+- Beyond the remaining cost basis, a return of capital is realized P&L, shown as
+  a disposal with no units. One paid after you sold every unit is realized in
+  full, on the lot the sale closed, and its cash is booked.
 - In another currency, the cost basis in your account and base currency moves by
   the amount at the day's rate, as the CRA converts the adjusted cost base when
   a return of capital is received; the purchase keeps the rate it was bought at.
-- No units move, and net contribution does not change. Because income moves by
-  the amount, your total gain stays the change in value.
+- No units move, and net contribution does not change. A reclassification
+  changes the breakdown of income and gains without creating or removing
+  investment profit. A non-cash distribution creates no cash or contribution.
 - A return of capital on an asset the account has never held, or a notional
   distribution on one it holds no units of, is rejected, and is left out of
   performance and holdings income.

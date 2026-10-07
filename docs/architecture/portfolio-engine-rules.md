@@ -298,18 +298,24 @@ it (§5). Fixtures: every other fixture is FIFO.
 - A method is added with its entry here, hand-worked fixtures, and every
   property law passing under it (§9).
 
-**R7.4 Returns of capital and notional distributions.** A return of capital pays
-back part of the investor's own capital, not income. It reduces the asset's cost
-basis, and once the cost basis reaches zero the rest is a capital gain. The CRA
-deems a negative adjusted cost base a capital gain and resets it to zero; IRS
-Publication 550 treats nondividend distributions beyond basis as capital gains.
-A notional distribution is a taxable distribution reinvested without new units:
-the fund issues units and consolidates them at once, so the holding keeps its
-units. Fund companies also call it a phantom, non-cash or reinvested
-distribution. It is income, and it raises the cost basis by its amount. A T3
-slip reports both in box 42, "amount resulting in cost base adjustment":
-positive for a return of capital, negative for a notional distribution. They are
-recorded as:
+**R7.4 Returns of capital and notional distributions.** These are per-account
+book-cost and performance calculations under the selected cost basis method. The
+user or broker supplies the distribution's classification; the engine does not
+determine taxable income or apply country-specific tax rules. Tax reporting may
+require different lot allocation, cross-account pooling or other adjustments
+(see §8).
+
+A return of capital pays back part of the investor's capital. It reduces book
+cost, and any amount beyond the remaining basis is recorded as realized P&L. A
+notional distribution records income reinvested without additional units: it
+increases both income and book cost by the entered amount. It is not a general
+basis correction, nor does it represent every non-cash tax event.
+
+Canadian fund distributions provide examples: a positive T3 box 42 amount
+reduces ACB, while a negative amount increases it. A reinvested distribution may
+issue and immediately consolidate units, leaving the holding's units unchanged.
+The CRA and IRS examples in the fixtures illustrate supported scenarios; they do
+not establish general tax compliance. The activities are recorded as:
 
 - DIVIDEND with subtype `RETURN_OF_CAPITAL`: a distribution paid in cash that is
   capital. It books its cash as a dividend does and is no income; its fee and
@@ -326,14 +332,16 @@ How each moves cost:
 - The amount converts to the position's currency as a trade's price does (its
   own rate when one side is the account's currency, else the day's). It acts on
   the cost basis the account's method keeps. A return of capital is a disposal
-  of no units: under WAC the lots pool first, as for a sale, and the pool is the
-  basis (R7.2), so the average falls by the amount per unit and nothing is
-  realized while the pool's cost covers it. Under FIFO, LIFO and HIFO it spreads
-  over the long lots by their units after splits, so every unit's cost moves
-  alike, as the IRS applies a nondividend distribution share by share. A
-  notional distribution is a purchase of no units: like a purchase, it does not
-  pool, and it spreads over the long lots by units. Lots keep their order by
-  cost per unit for HIFO (lots a return of capital takes to zero then tie).
+  of no units: under WAC the lots pool first where R7.2 permits it. Lots kept
+  separate for transfer or split history still form one basis pool in each
+  currency: the amount recovers their basis in proportion to book cost, with
+  only the pool's excess spread by units and realized. Thus nothing is realized
+  while the combined basis covers the amount. Under FIFO, LIFO and HIFO the
+  engine's allocation convention spreads it over the long lots by their units
+  after splits, so every unit's cost moves alike. A notional distribution is a
+  purchase of no units: like a purchase, it does not pool, and it spreads over
+  the long lots by units. Lots keep their order by cost per unit for HIFO (lots
+  a return of capital takes to zero then tie).
 - Each lot's cost moves by its share in the position's currency, and its book
   cost in the account and base currency by the share at the distribution day's
   rate. The CRA converts the ACB "using the exchange rate in effect at the time
@@ -342,20 +350,23 @@ How each moves cost:
   apart from its acquisition rates, so its purchase price and charges, and what
   its purchase and charges cost in the account and base currency, stay as bought
   (its lot row and the transfers it opened read them). A disposal takes its
-  units' share of the book cost.
+  units' share of the book cost. A transfer that covers an opposite position
+  divides those book costs between the covered and remaining units. A
+  capitalized transfer fee increases explicit book costs at the carried
+  acquisition rates, following the existing transfer-fee policy (R2.4).
 - A return of capital realizes nothing while the basis covers it. When a share
   exceeds the basis in either currency, the basis there goes to zero and the
-  excess is a capital gain, recorded as a disposal row with no units: its
-  proceeds are the share, its cost what the basis covered. With no units left
-  (the distribution's record date preceded a sale), all of it is a capital gain
-  on the lot the account's last disposal of the asset closed.
+  excess is realized P&L, recorded as a disposal row with no units: its proceeds
+  are the share, its cost what the basis covered. With no units left (the
+  distribution's record date preceded a sale), all of it is realized P&L on the
+  lot the account's last disposal of the asset closed.
 - A notional distribution raises the cost and book cost by the share and
   realizes nothing.
 - Neither moves units, net contribution or flows. Income moves by the amount:
   down for a return of capital adjustment, not at all for a cash return of
   capital, up for a notional distribution. The unrealized P&L the cost change
-  causes, plus any capital gain it realizes, adds back to that, so the gain is
-  the change in value.
+  causes, plus any realized P&L, adds back to that, so the gain is the change in
+  value.
 - It is rejected, changing nothing in the fold or in performance (architecture
   §4, per-activity atomicity), when the account has never held the asset (a
   return of capital) or holds no units of it (a notional distribution), or when
@@ -368,8 +379,8 @@ How each moves cost:
   NOM-ACB-01 (the CRA's mutual fund ACB chart, with a T3 box 42 return of
   capital), NOM-ACB-02 (the CRA's negative ACB example), NOM-ACB-03 (a phantom
   distribution, and one paid as a return of capital) and NOM-ACB-04 (the ACB is
-  the pool's average). In a CAD account with a CAD base, a WAC account's cost
-  basis is the ACB.
+  the pool's average). These single-account CAD examples illustrate average
+  basis; a taxpayer's ACB may require pooling across accounts.
 
 ## 8. Known limits
 
