@@ -135,7 +135,7 @@ fn compile_leg(leg: &Leg, account: &AccountFacts, facts: &CanonicalFacts) -> Eco
     let action = action_for(activity, &mut diagnostics);
     let contribution = contribution_for(activity, facts);
     let flow = flow_for(activity, facts, multiplier, cash.as_ref(), &mut diagnostics);
-    let attribution = attribution_for(activity, account);
+    let attribution = attribution_for(activity, account, &action);
 
     EconomicEvent {
         id: leg.event_id.clone(),
@@ -347,6 +347,19 @@ fn action_for(activity: &Activity, diagnostics: &mut Vec<Diagnostic>) -> Action 
             ));
             Action::None
         }
+        (Adjustment, None)
+            if matches!(
+                activity.subtype,
+                Some(Subtype::ReturnOfCapital | Subtype::NotionalDistribution)
+            ) =>
+        {
+            diagnostics.push(Diagnostic::error(
+                DiagnosticCode::UnknownAsset,
+                activity.id.as_str(),
+                "cost basis adjustment requires an asset",
+            ));
+            Action::None
+        }
         (Adjustment, Some(asset)) if activity.subtype == Some(Subtype::OptionExpiry) => {
             Action::OptionExpiry {
                 asset,
@@ -382,7 +395,7 @@ fn action_for(activity: &Activity, diagnostics: &mut Vec<Diagnostic>) -> Action 
 /// on deposits, withdrawals and transfers are booked but knowingly not
 /// attributed. Credit-card interest is a charge on a liability (its cash is
 /// negative), so its amount is attributed as a fee, never as income.
-fn attribution_for(activity: &Activity, account: &AccountFacts) -> Attributed {
+fn attribution_for(activity: &Activity, account: &AccountFacts, action: &Action) -> Attributed {
     use ActivityKind::*;
     let amount = activity.amount.unwrap_or(Decimal::ZERO);
     let (fee, tax) = (activity.fee, activity.tax);
@@ -431,11 +444,11 @@ fn attribution_for(activity: &Activity, account: &AccountFacts) -> Attributed {
         // cost change causes is no gain (rules R7.4): a return of capital
         // takes capital back out of dividends already counted as income; a
         // notional distribution is income reinvested as cost.
-        Adjustment if activity.subtype == Some(Subtype::ReturnOfCapital) => Attributed {
+        Adjustment if matches!(action, Action::ReturnOfCapital { .. }) => Attributed {
             income: -amount.abs(),
             ..Attributed::default()
         },
-        Adjustment if activity.subtype == Some(Subtype::NotionalDistribution) => Attributed {
+        Adjustment if matches!(action, Action::NotionalDistribution { .. }) => Attributed {
             income: amount.abs(),
             ..Attributed::default()
         },

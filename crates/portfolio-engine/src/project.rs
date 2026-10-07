@@ -836,7 +836,18 @@ impl Projector<'_> {
         run: &mut RunLog,
     ) -> Result<(), String> {
         match &event.action {
-            Action::None => self.apply_cash_only(event, state, run),
+            Action::None => {
+                if event.kind == ActivityKind::Adjustment {
+                    if let Some(diagnostic) = event
+                        .diagnostics
+                        .iter()
+                        .find(|diagnostic| diagnostic.code == DiagnosticCode::UnknownAsset)
+                    {
+                        return Err(diagnostic.message.clone());
+                    }
+                }
+                self.apply_cash_only(event, state, run)
+            }
             Action::Trade {
                 asset,
                 side,
@@ -2067,11 +2078,12 @@ impl Projector<'_> {
                     k: usize,
                     proceeds: Decimal,
                     proceeds_base: Option<Decimal>,
-                    [cost, cost_base]: [Decimal; 2]| {
+                    cost: Decimal,
+                    cost_base: Option<Decimal>| {
             let stored_proceeds = proceeds.round_dp(STORED_PRECISION);
             let stored_cost = cost.round_dp(STORED_PRECISION);
             let stored_proceeds_base = proceeds_base.unwrap_or_default().round_dp(STORED_PRECISION);
-            let stored_cost_base = cost_base.round_dp(STORED_PRECISION);
+            let stored_cost_base = cost_base.unwrap_or_default().round_dp(STORED_PRECISION);
             LotDisposal {
                 id: format!("{}:{lot_id}:{k}", event.id),
                 lot_id: lot_id.to_string(),
@@ -2085,7 +2097,7 @@ impl Projector<'_> {
                 realized_pnl: (stored_proceeds - stored_cost).round_dp(STORED_PRECISION),
                 proceeds_base: stored_proceeds_base,
                 cost_basis_base: stored_cost_base,
-                realized_pnl_base: if proceeds_base.is_some() {
+                realized_pnl_base: if proceeds_base.is_some() && cost_base.is_some() {
                     (stored_proceeds_base - stored_cost_base).round_dp(STORED_PRECISION)
                 } else {
                     Decimal::ZERO
@@ -2106,7 +2118,8 @@ impl Projector<'_> {
                 0,
                 in_position,
                 in_base,
-                [Decimal::ZERO, Decimal::ZERO],
+                Decimal::ZERO,
+                Some(Decimal::ZERO),
             ));
             return Ok(());
         };
@@ -2189,13 +2202,9 @@ impl Projector<'_> {
             {
                 continue;
             }
-            effects.disposals.push(gain(
-                &lot.id,
-                k,
-                share,
-                base_share,
-                [relieved, relieved_base.unwrap_or_default()],
-            ));
+            effects
+                .disposals
+                .push(gain(&lot.id, k, share, base_share, relieved, relieved_base));
         }
         let allows_negative = position.lots.iter().any(|l| l.quantity < Decimal::ZERO);
         recalculate_aggregates(position, allows_negative)

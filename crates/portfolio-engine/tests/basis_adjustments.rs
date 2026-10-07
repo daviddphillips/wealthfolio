@@ -445,3 +445,78 @@ fn a_sale_of_known_zero_base_basis_is_realized_but_missing_fx_stays_excluded() {
             wealthfolio_portfolio_engine::model::QualityNote::RealizedSkippedAcquisitionFx { .. }
         )));
 }
+
+#[test]
+fn assetless_cost_adjustments_are_rejected_without_income_or_gain() {
+    let baseline = inline(WAC_FOREIGN);
+    for subtype in [
+        "RETURN_OF_CAPITAL",
+        "Return of Capital",
+        "NOTIONAL_DISTRIBUTION",
+        "notional-distribution",
+    ] {
+        let yaml = WAC_FOREIGN.replace("quotes:", &format!("  - {{ id: bad, account: a, type: ADJUSTMENT, subtype: {subtype}, date: 2025-01-08T10:00:00Z, amount: 20 }}\nquotes:"));
+        let p = inline(&yaml);
+        assert_eq!(
+            p.bundle.final_state, baseline.bundle.final_state,
+            "{subtype}"
+        );
+        assert!(p
+            .bundle
+            .rejected_activities()
+            .contains(&wealthfolio_portfolio_engine::model::ActivityId::new("bad")));
+        let lots = p.lots();
+        let base_lots = baseline.lots();
+        let account = AccountId::new("a");
+        let result = measure_account(
+            &p.measure_inputs(&lots),
+            &account,
+            Window::default(),
+            MeasureProfile::Full,
+            false,
+        )
+        .unwrap();
+        let expected = measure_account(
+            &baseline.measure_inputs(&base_lots),
+            &account,
+            Window::default(),
+            MeasureProfile::Full,
+            false,
+        )
+        .unwrap();
+        assert_eq!(result.attribution, expected.attribution, "{subtype}");
+        assert_eq!(result.summary.amount, expected.summary.amount, "{subtype}");
+    }
+}
+
+#[test]
+fn roc_keeps_known_proceeds_but_no_base_gain_without_acquisition_cost() {
+    let p = inline(
+        r#"
+id: ROC-UNKNOWN-BASE-COST
+policy: { base_currency: CAD, timezone: UTC, as_of: 2025-01-08 }
+accounts:
+  - { id: a, currency: CAD }
+assets:
+  - { id: ETF, quote_ccy: USD }
+activities:
+  - { id: buy, account: a, type: BUY, date: 2025-01-06T10:00:00Z, asset: ETF, quantity: 10, unit_price: 10, amount: 100, currency: USD }
+  - { id: roc, account: a, type: DIVIDEND, subtype: RETURN_OF_CAPITAL, date: 2025-01-07T10:00:00Z, asset: ETF, amount: 150, currency: USD, fx_rate: 2 }
+"#,
+    );
+    let disposal = p
+        .bundle
+        .disposals
+        .iter()
+        .find(|d| d.event.as_str() == "roc")
+        .unwrap();
+    assert_eq!(disposal.realized_pnl, dec!(50));
+    assert_eq!(disposal.proceeds_base, dec!(300));
+    assert_eq!(disposal.cost_basis_base, dec!(0));
+    assert_eq!(disposal.realized_pnl_base, dec!(0));
+    assert!(
+        p.bundle.final_state.accounts[&AccountId::new("a")].positions[&AssetId::new("ETF")].lots[0]
+            .book_cost_base
+            .is_none()
+    );
+}

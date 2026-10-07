@@ -342,6 +342,28 @@ mod tests {
     }
 
     #[test]
+    fn test_cost_adjustment_validation_requires_asset_identity() {
+        for subtype in [
+            "RETURN_OF_CAPITAL",
+            "Return of Capital",
+            "notional-distribution",
+        ] {
+            let mut activity = create_test_new_activity();
+            activity.activity_type = "ADJUSTMENT".to_string();
+            activity.subtype = Some(subtype.to_string());
+            activity.asset = None;
+            assert!(activity.validate().is_err(), "{subtype}");
+            activity.asset = Some(AssetResolutionInput {
+                symbol: Some(" ".to_string()),
+                ..Default::default()
+            });
+            assert!(activity.validate().is_err(), "{subtype}");
+            activity.asset.as_mut().unwrap().symbol = Some("ETF".to_string());
+            assert!(activity.validate().is_ok(), "{subtype}");
+        }
+    }
+
+    #[test]
     fn test_new_activity_validation_empty_account() {
         let mut activity = create_test_new_activity();
         activity.account_id = "".to_string();
@@ -546,6 +568,34 @@ mod tests {
             )
             .as_deref(),
             Some("NOTIONAL_DISTRIBUTION")
+        );
+    }
+
+    #[test]
+    fn test_cost_basis_labels_normalize_separators_but_unknown_labels_stay_original() {
+        for label in [
+            "Return of Capital",
+            "return-of-capital",
+            " RETURN_OF_CAPITAL ",
+        ] {
+            assert_eq!(
+                NewActivity::canonicalize_subtype(Some(label)).as_deref(),
+                Some("RETURN_OF_CAPITAL")
+            );
+        }
+        for label in [
+            "Notional Distribution",
+            "notional-distribution",
+            "notional_distribution",
+        ] {
+            assert_eq!(
+                NewActivity::canonicalize_subtype(Some(label)).as_deref(),
+                Some("NOTIONAL_DISTRIBUTION")
+            );
+        }
+        assert_eq!(
+            NewActivity::canonicalize_subtype(Some("Provider Custom-Label")).as_deref(),
+            Some("Provider Custom-Label")
         );
     }
 

@@ -12,7 +12,6 @@ import { useQuoteHistory } from "@/hooks/use-quote-history";
 import { useSyncMarketDataMutation } from "@/hooks/use-sync-market-data";
 import { useAssetTaxonomyAssignments, useTaxonomy } from "@/hooks/use-taxonomies";
 import { getActivityRestrictionLevel } from "@/lib/activity-restrictions";
-import { ActivityStatus, ActivityType } from "@/lib/constants";
 import { generateId } from "@/lib/id";
 import { QueryKeys } from "@/lib/query-keys";
 import { useSettingsContext } from "@/lib/settings-provider";
@@ -331,7 +330,7 @@ export const AssetProfilePage = () => {
     holdings: allHoldings,
     isLoading: isHoldingLoading,
     isError: isHoldingError,
-  } = useHoldings({ type: "all" });
+  } = useHoldings({ type: "all" }, { includeClosed: true });
 
   const holding = useMemo<Holding | null>(() => {
     if (!assetId) return null;
@@ -761,22 +760,9 @@ export const AssetProfilePage = () => {
             return first && last != null && first !== 0 ? Number(last / first - 1) : null;
           })()
         : null;
-    const incomeActivities = assetActivities.filter(
-      (activity) =>
-        activity.assetId === assetId &&
-        activity.status === ActivityStatus.POSTED &&
-        (activity.activityType === ActivityType.DIVIDEND ||
-          activity.activityType === ActivityType.INTEREST),
-    );
-    const fallbackIncome = incomeActivities.reduce<number | null>((sum, activity) => {
-      if (sum == null) return null;
-      if (activity.currency.trim().toUpperCase() !== displayCurrency.trim().toUpperCase()) {
-        return null;
-      }
-      const amount = Number(activity.amount ?? 0);
-      return Number.isFinite(amount) ? sum + amount : sum;
-    }, 0);
-    const income = holding?.income?.local != null ? Number(holding.income.local) : fallbackIncome;
+    // Closed positions use the engine's income too, including reclassifications
+    // and rejected-activity filtering. Raw dividend rows cannot reproduce it.
+    const income = holding?.income?.local != null ? Number(holding.income.local) : null;
     const realizedLots = assetLots.filter(
       (lot) => lot.source === "TRANSACTION_LOT" && lot.valuationRealizedPnl != null,
     );

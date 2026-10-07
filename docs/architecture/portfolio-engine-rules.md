@@ -332,6 +332,12 @@ not establish general tax compliance. The activities are recorded as:
 - ADJUSTMENT with subtype `NOTIONAL_DISTRIBUTION`: no cash and no units. It adds
   its amount to cost and to income.
 
+Both adjustment subtypes require an asset on save and import. A malformed stored
+row without an asset is rejected by the fold and contributes no income. These
+subtypes accept spaces and hyphens in place of underscores, consistently in the
+engine and reporting readers; new saves use the canonical spelling. Unknown
+provider labels are preserved.
+
 How each moves cost:
 
 - The amount converts to the position's currency as a trade's price does (its
@@ -361,6 +367,9 @@ How each moves cost:
   acquisition rates, following the existing transfer-fee policy (R2.4). A zero
   cost in one currency does not discard a nonzero cost in another; known zero
   base cost remains valid for realized P&L.
+- Known distribution proceeds do not make an unknown acquisition base cost
+  known. Like an ordinary sale (R3.4), its base realized P&L remains zero when
+  either proceeds or relieved base cost is unknown; known proceeds are retained.
 - A return of capital realizes nothing while the basis covers it. When a share
   exceeds the basis in either currency, the basis there goes to zero and the
   excess is realized P&L, recorded as a disposal row with no units: its proceeds
@@ -382,6 +391,9 @@ How each moves cost:
   day's rate into a currency reduces the book cost there with the cost, and its
   base attribution is zero. Every reader follows the rejection: performance and
   holdings income leave the activity out.
+- The asset page requests closed holdings too and uses their calculated income,
+  so a fully sold position follows the same reclassification and rejection
+  rules.
 - Fixtures: EDGE-ROC-01 to EDGE-ROC-05; and the Canadian worked examples
   NOM-ACB-01 (the CRA's mutual fund ACB chart, with a T3 box 42 return of
   capital), NOM-ACB-02 (the CRA's negative ACB example), NOM-ACB-03 (a phantom

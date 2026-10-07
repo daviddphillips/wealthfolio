@@ -414,29 +414,30 @@ impl NewActivity {
     pub fn canonicalize_subtype(subtype: Option<&str>) -> Option<String> {
         let subtype = subtype.map(str::trim).filter(|value| !value.is_empty())?;
 
-        let canonical = if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DRIP) {
+        let normalized = subtype.replace([' ', '-'], "_");
+        let canonical = if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DRIP) {
             ACTIVITY_SUBTYPE_DRIP
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND) {
             ACTIVITY_SUBTYPE_DIVIDEND_IN_KIND
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_STAKING_REWARD) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_STAKING_REWARD) {
             ACTIVITY_SUBTYPE_STAKING_REWARD
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_BONUS) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_BONUS) {
             ACTIVITY_SUBTYPE_BONUS
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REBATE) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REBATE) {
             ACTIVITY_SUBTYPE_REBATE
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REFUND) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REFUND) {
             ACTIVITY_SUBTYPE_REFUND
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REIMBURSEMENT) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_REIMBURSEMENT) {
             ACTIVITY_SUBTYPE_REIMBURSEMENT
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_OPTION_EXPIRY) {
             ACTIVITY_SUBTYPE_OPTION_EXPIRY
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_OPEN) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_OPEN) {
             ACTIVITY_SUBTYPE_POSITION_OPEN
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_CLOSE) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_POSITION_CLOSE) {
             ACTIVITY_SUBTYPE_POSITION_CLOSE
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL) {
             ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL
-        } else if subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION) {
+        } else if normalized.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION) {
             ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION
         } else {
             subtype
@@ -560,6 +561,25 @@ impl NewActivity {
         }
 
         validate_activity_date(&self.activity_date)?;
+
+        let subtype =
+            Self::canonicalize_subtype_for_activity(&self.activity_type, self.subtype.as_deref());
+        if self
+            .activity_type
+            .eq_ignore_ascii_case(ACTIVITY_TYPE_ADJUSTMENT)
+            && matches!(
+                subtype.as_deref(),
+                Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL | ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION)
+            )
+            && ![self.get_asset_resolution_id(), self.get_asset_symbol()]
+                .into_iter()
+                .flatten()
+                .any(|value| !value.trim().is_empty())
+        {
+            return Err(ActivityError::InvalidData(
+                "Cost basis adjustments require an asset_id or symbol".to_string(),
+            ));
+        }
 
         Self::validate_asset_backed_income_values(
             &self.activity_type,

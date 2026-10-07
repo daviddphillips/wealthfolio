@@ -1,5 +1,5 @@
 use crate::activities::{
-    Activity, ActivityRepositoryTrait, ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION,
+    Activity, ActivityRepositoryTrait, NewActivity, ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION,
     ACTIVITY_SUBTYPE_OPTION_EXPIRY, ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL, ACTIVITY_TYPE_ADJUSTMENT,
     ACTIVITY_TYPE_BUY, ACTIVITY_TYPE_DIVIDEND, ACTIVITY_TYPE_INTEREST, ACTIVITY_TYPE_SELL,
 };
@@ -828,7 +828,8 @@ impl HoldingsService {
                         let is_return_of_capital = (activity_type == ACTIVITY_TYPE_ADJUSTMENT
                             || activity_type == ACTIVITY_TYPE_DIVIDEND)
                             && activity.subtype.as_deref().is_some_and(|subtype| {
-                                subtype.eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL)
+                                NewActivity::canonicalize_subtype(Some(subtype)).as_deref()
+                                    == Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL)
                             });
                         is_trade || is_option_expiry || is_return_of_capital
                     })
@@ -1063,16 +1064,9 @@ fn calculate_asset_income(
 /// counts each once.
 fn asset_income_amount(activity: &Activity) -> Option<Decimal> {
     let activity_type = activity.effective_type();
-    let return_of_capital = activity.subtype.as_deref().is_some_and(|subtype| {
-        subtype
-            .trim()
-            .eq_ignore_ascii_case(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL)
-    });
-    let notional = activity.subtype.as_deref().is_some_and(|subtype| {
-        subtype
-            .trim()
-            .eq_ignore_ascii_case(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION)
-    });
+    let subtype = NewActivity::canonicalize_subtype(activity.subtype.as_deref());
+    let return_of_capital = subtype.as_deref() == Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL);
+    let notional = subtype.as_deref() == Some(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION);
     let adjusted = || activity.amount.unwrap_or_default().abs();
     if activity_type == ACTIVITY_TYPE_DIVIDEND && return_of_capital {
         None
@@ -3527,19 +3521,19 @@ mod tests {
             activity(
                 "capital",
                 ACTIVITY_TYPE_DIVIDEND,
-                Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL),
+                Some("Return of Capital"),
                 dec!(40),
             ),
             activity(
                 "reclassified",
                 ACTIVITY_TYPE_ADJUSTMENT,
-                Some(ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL),
+                Some("return-of-capital"),
                 dec!(25),
             ),
             activity(
                 "notional",
                 ACTIVITY_TYPE_ADJUSTMENT,
-                Some(ACTIVITY_SUBTYPE_NOTIONAL_DISTRIBUTION),
+                Some("Notional Distribution"),
                 dec!(10),
             ),
             activity(

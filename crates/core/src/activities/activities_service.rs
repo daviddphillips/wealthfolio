@@ -819,7 +819,10 @@ impl ActivityService {
         quantity: Option<Decimal>,
         unit_price: Option<Decimal>,
     ) -> ImportSymbolDisposition {
-        if NewActivity::is_asset_backed_income_subtype(activity_type, subtype) {
+        if NewActivity::is_asset_backed_income_subtype(activity_type, subtype)
+            || (activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_ADJUSTMENT)
+                && Self::requires_asset_identity(activity_type, subtype))
+        {
             ImportSymbolDisposition::ResolveAsset
         } else {
             classify_import_activity(activity_type, symbol, quantity, unit_price)
@@ -828,7 +831,8 @@ impl ActivityService {
 
     fn requires_asset_identity(activity_type: &str, subtype: Option<&str>) -> bool {
         if activity_type.eq_ignore_ascii_case(ACTIVITY_TYPE_ADJUSTMENT) {
-            return subtype.is_some_and(|subtype| {
+            let subtype = NewActivity::canonicalize_subtype_for_activity(activity_type, subtype);
+            return subtype.as_deref().is_some_and(|subtype| {
                 [
                     ACTIVITY_SUBTYPE_OPTION_EXPIRY,
                     ACTIVITY_SUBTYPE_RETURN_OF_CAPITAL,
