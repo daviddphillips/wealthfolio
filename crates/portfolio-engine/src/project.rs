@@ -376,7 +376,6 @@ struct Projector<'a> {
 
 struct Reduction {
     quantity_reduced: Decimal,
-    cost_basis_removed: Decimal,
     removed_lots: Vec<Lot>,
     fully_consumed: Vec<Lot>,
 }
@@ -404,11 +403,14 @@ pub(crate) fn position_book_cost(
     target: &str,
     day: NaiveDate,
 ) -> Result<Decimal, (DiagnosticCode, String)> {
-    if alternative || total_cost_basis.is_zero() {
+    if alternative {
         return Ok(Decimal::ZERO);
     }
     if let Some(cost) = at_acquisition {
         return Ok(cost);
+    }
+    if total_cost_basis.is_zero() {
+        return Ok(Decimal::ZERO);
     }
     let rate = fx.rate(currency, target, day).ok_or_else(|| {
         (
@@ -671,6 +673,8 @@ impl Projector<'_> {
             split_ratio: Decimal::ONE,
             book_cost_account: adjusted.then_some(in_account),
             book_cost_base: adjusted.then_some(in_base),
+            opening_cost_basis: None,
+            opening_cost_basis_base: None,
         };
         let pooled: BTreeSet<usize> = members.iter().map(|(index, ..)| *index).collect();
         let lots = std::mem::take(&mut position.lots);
@@ -798,6 +802,9 @@ impl Projector<'_> {
         }
         let mut cost_basis = Decimal::ZERO;
         for (asset, position) in &account.positions {
+            if position.quantity.is_zero() {
+                continue;
+            }
             match position_book_cost(
                 self.fx,
                 position.alternative,
@@ -1620,10 +1627,15 @@ impl Projector<'_> {
         } else {
             (lots, None)
         };
+        let opening_base: Vec<_> = to_add
+            .iter()
+            .map(|lot| self.lot_book_cost(lot, position_currency.as_str(), self.base()))
+            .collect();
         let cost_basis_asset = add_transferred_lots(
             position,
             event.id.as_str(),
             &to_add,
+            &opening_base,
             info.allows_negative_lots,
         )?;
         // The leg's whole fee, paid from cash, goes into the lots it opens,
@@ -1676,9 +1688,7 @@ impl Projector<'_> {
                 effects,
                 run,
             )?;
-            if !position_currency.as_str().is_empty()
-                && reduction.cost_basis_removed != Decimal::ZERO
-            {
+            if !position_currency.as_str().is_empty() {
                 let removed_account = self.lots_cost_basis_in(
                     &reduction.removed_lots,
                     position_currency.as_str(),
@@ -1824,7 +1834,7 @@ impl Projector<'_> {
             reduction.quantity_reduced,
             run,
         );
-        if !position_currency.as_str().is_empty() && reduction.cost_basis_removed != Decimal::ZERO {
+        if !position_currency.as_str().is_empty() {
             let removed_account = self.lots_cost_basis_in(
                 &reduction.removed_lots,
                 position_currency.as_str(),
@@ -2663,11 +2673,16 @@ impl Projector<'_> {
         };
         let fees = original_fees(lot);
         let taxes = original_taxes(lot);
-        let original_cost_basis = checked(
-            arith::mul(lot.acquisition_price, original_quantity),
-            "closed lot cost",
-        )? + fees
-            + taxes;
+        let original_cost_basis = match lot.opening_cost_basis {
+            Some(cost) => cost,
+            None => {
+                checked(
+                    arith::mul(lot.acquisition_price, original_quantity),
+                    "closed lot cost",
+                )? + fees
+                    + taxes
+            }
+        };
         let fx_rate_to_base = self.lot_rate_to_base(lot, position_currency.as_str());
         let base =
             |value: Decimal| checked(arith::mul(value, fx_rate_to_base), "closed lot base cost");
@@ -2682,7 +2697,10 @@ impl Projector<'_> {
             original_quantity,
             cost_per_unit: lot.acquisition_price,
             original_cost_basis,
-            original_cost_basis_base: base(original_cost_basis)?,
+            original_cost_basis_base: match lot.opening_cost_basis_base {
+                Some(cost) => cost,
+                None => base(original_cost_basis)?,
+            },
             fee_allocated: fees,
             fee_allocated_base: base(fees)?,
             tax_allocated: taxes,
@@ -3090,6 +3108,12 @@ fn add_fee(
         .book_cost_base
         .map(|book| fee_in(&lot.base_currency, lot.fx_rate_to_base).map(|fee| book + fee))
         .transpose()?;
+    let opening_base = lot
+        .opening_cost_basis_base
+        .map(|book| fee_in(&lot.base_currency, lot.fx_rate_to_base).map(|fee| book + fee))
+        .transpose()?;
+    lot.opening_cost_basis = lot.opening_cost_basis.map(|book| book + fee);
+    lot.opening_cost_basis_base = opening_base;
     lot.cost_basis += fee;
     lot.fees += fee;
     lot.original_fees += fee;
@@ -3195,6 +3219,8 @@ fn new_lot(
         split_ratio: Decimal::ONE,
         book_cost_account: None,
         book_cost_base: None,
+        opening_cost_basis: None,
+        opening_cost_basis_base: None,
     })
 }
 
@@ -3256,6 +3282,7 @@ fn add_transferred_lots(
     position: &mut Position,
     prefix: &str,
     lots: &[Lot],
+    opening_base: &[Option<Decimal>],
     allows_negative: bool,
 ) -> Result<Decimal, String> {
     let mut total = Decimal::ZERO;
@@ -3288,6 +3315,8 @@ fn add_transferred_lots(
             split_ratio: source.split_ratio,
             book_cost_account: source.book_cost_account,
             book_cost_base: source.book_cost_base,
+            opening_cost_basis: Some(source.cost_basis),
+            opening_cost_basis_base: opening_base[i],
         };
         total += lot.cost_basis;
         position.lots.push(lot);
@@ -3385,7 +3414,6 @@ fn relieve(
         .sum();
     let empty = Reduction {
         quantity_reduced: Decimal::ZERO,
-        cost_basis_removed: Decimal::ZERO,
         removed_lots: Vec::new(),
         fully_consumed: Vec::new(),
     };
@@ -3403,7 +3431,6 @@ fn relieve(
     let mut removed_lots = Vec::new();
     let mut fully_consumed = Vec::new();
     let mut quantity_reduced = Decimal::ZERO;
-    let mut cost_removed = Decimal::ZERO;
     let mut keep: Vec<Lot> = Vec::with_capacity(position.lots.len());
     for (mut lot, consume) in position.lots.drain(..).zip(taken) {
         if consume <= Decimal::ZERO {
@@ -3456,10 +3483,11 @@ fn relieve(
                 split_ratio: ratio,
                 book_cost_account: book_account_removed,
                 book_cost_base: book_base_removed,
+                opening_cost_basis: None,
+                opening_cost_basis_base: None,
             });
         }
         quantity_reduced += consume;
-        cost_removed += basis_removed;
         let remaining = lot.quantity - removed_signed;
         let consumed = if negative {
             remaining >= Decimal::ZERO
@@ -3492,7 +3520,6 @@ fn relieve(
     recalculate_aggregates(position, allows_negative)?;
     Ok(Reduction {
         quantity_reduced,
-        cost_basis_removed: cost_removed,
         removed_lots,
         fully_consumed,
     })
@@ -3648,7 +3675,9 @@ pub fn lot_records(
                     lot.original_taxes
                 };
                 // In range: the fold checked this product when the lot opened.
-                let original_cost_basis = lot.acquisition_price * original_quantity + fees + taxes;
+                let original_cost_basis = lot
+                    .opening_cost_basis
+                    .unwrap_or_else(|| lot.acquisition_price * original_quantity + fees + taxes);
                 let rate = lot
                     .stored_fx_rate_to(base)
                     .or_else(|| fx.rate(position.currency.as_str(), base, lot.acquisition_date))
@@ -3668,7 +3697,9 @@ pub fn lot_records(
                         cost_per_unit: lot.acquisition_price,
                         original_cost_basis,
                         remaining_cost_basis: lot.cost_basis,
-                        original_cost_basis_base: at_rate(original_cost_basis),
+                        original_cost_basis_base: lot
+                            .opening_cost_basis_base
+                            .unwrap_or_else(|| at_rate(original_cost_basis)),
                         // The purchase converts at its acquisition rate; what
                         // is left, as adjustments moved it (rules R7.4).
                         remaining_cost_basis_base: lot

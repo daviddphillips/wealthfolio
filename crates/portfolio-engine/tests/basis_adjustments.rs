@@ -6,7 +6,10 @@ use std::str::FromStr;
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use support::*;
-use wealthfolio_portfolio_engine::model::{AccountId, AssetId};
+use wealthfolio_portfolio_engine::model::{AccountId, AssetId, BasisStatus, DateRange};
+use wealthfolio_portfolio_engine::{
+    effects, lot_records, measure_account, project, MeasureProfile, Window,
+};
 
 fn inline(yaml: &str) -> Pipeline {
     Pipeline::from_scenario(&serde_yaml::from_str::<Scenario>(yaml).unwrap())
@@ -63,7 +66,7 @@ fx_rates:
 #[test]
 fn transfer_cover_slices_adjusted_book_cost() {
     let yaml = TRANSFER.replace("TRANSFER_FEE", "0").replace(
-        "  - { id: nd,", 
+        "  - { id: nd,",
         "  - { id: short, account: b, type: SELL, subtype: POSITION_OPEN, date: 2025-01-06T09:00:00Z, asset: ETF, quantity: 4, unit_price: 10, amount: 40, currency: USD, fx_rate: 1.4 }\n  - { id: nd,"
     );
     let p = inline(&yaml);
@@ -90,7 +93,7 @@ fn transfer_fee_is_added_to_adjusted_book_cost() {
 #[test]
 fn transfer_cover_without_adjustment_is_a_passing_control() {
     let yaml = TRANSFER.replace("TRANSFER_FEE", "0").replace(
-        "  - { id: nd,", 
+        "  - { id: nd,",
         "  - { id: short, account: b, type: SELL, subtype: POSITION_OPEN, date: 2025-01-06T09:00:00Z, asset: ETF, quantity: 4, unit_price: 10, amount: 40, currency: USD, fx_rate: 1.4 }\n  - { id: nd,"
     );
     let yaml = yaml
@@ -204,6 +207,11 @@ fn wac_roc_keeps_foreign_book_cost_after_local_basis_reaches_zero() {
         .map(|lot| lot.remaining_cost_basis_base)
         .sum();
     assert_eq!(lots.round_dp(8), dec!(25.5));
+    let account = &p.bundle.final_state.accounts[&AccountId::new("a")];
+    assert_eq!(account.cost_basis.round_dp(8), dec!(25.5));
+    let valuation = p.series[&AccountId::new("a")].days.last().unwrap();
+    assert_eq!(valuation.cost_basis_base.round_dp(8), dec!(25.5));
+    assert_eq!(valuation.basis_status, BasisStatus::Complete);
 }
 
 fn performance(yaml: &str) -> serde_json::Value {
@@ -270,4 +278,170 @@ fn transfer_fee_updates_distinct_account_and_base_book_costs() {
     // CAD: 120 purchase + 28 reinvestment + 6 fee. EUR: 150 + 36 + 7.5.
     assert_eq!(position.cost_basis_account.unwrap().round_dp(8), dec!(154));
     assert_eq!(position.cost_basis_base.unwrap().round_dp(8), dec!(193.5));
+}
+
+#[test]
+fn paired_transfer_preserves_foreign_contributions_when_local_basis_is_zero() {
+    let before = WAC_FOREIGN
+        .replace("amount: 4,", "amount: 11,")
+        .replace("rate: 4 }", "rate: 0.5 }")
+        .replace(
+            "  - { id: a, currency: CAD,",
+            "  - { id: b, currency: CAD }\n  - { id: a, currency: CAD,",
+        );
+    let after = before.replace("quotes:", "  - { id: out, account: a, type: TRANSFER_OUT, date: 2025-01-08T10:00:00Z, asset: ETF, quantity: 2, unit_price: 10, source_group_id: g }\n  - { id: in, account: b, type: TRANSFER_IN, date: 2025-01-08T11:00:00Z, asset: ETF, quantity: 2, unit_price: 10, source_group_id: g }\nquotes:");
+    let sender = inline(&before);
+    let transferred = inline(&after);
+    let contribution = |pipeline: &Pipeline| -> Decimal {
+        pipeline
+            .bundle
+            .final_state
+            .accounts
+            .values()
+            .map(|account| account.net_contribution_base)
+            .sum()
+    };
+    assert_eq!(contribution(&transferred), contribution(&sender));
+    let accounts = &transferred.bundle.final_state.accounts;
+    assert_eq!(
+        accounts[&AccountId::new("a")]
+            .net_contribution_base
+            .round_dp(8),
+        dec!(75.5)
+    );
+    assert_eq!(
+        accounts[&AccountId::new("b")]
+            .net_contribution_base
+            .round_dp(8),
+        dec!(25.5)
+    );
+    assert_eq!(
+        accounts[&AccountId::new("b")].cost_basis.round_dp(8),
+        dec!(25.5)
+    );
+    assert!(transferred
+        .bundle
+        .disposals
+        .iter()
+        .all(|disposal| disposal.realized_pnl_base.is_zero()));
+}
+
+fn unquoted_transfer(fee: &str) -> String {
+    let yaml = TRANSFER.replace("TRANSFER_FEE", fee);
+    let (activities, quotes_and_fx) = yaml.split_once("quotes:").unwrap();
+    let (_, fx) = quotes_and_fx.split_once("fx_rates:").unwrap();
+    format!("{activities}fx_rates:{fx}")
+}
+
+#[test]
+fn unquoted_transfer_flows_keep_delivery_cost_after_later_changes() {
+    for fee in ["0", "5"] {
+        for later in [
+            "",
+            "  - { id: later, account: b, type: SELL, date: 2025-01-09T10:00:00Z, asset: ETF, quantity: 4, unit_price: 10, amount: 40, currency: USD }\n",
+            "  - { id: later, account: b, type: SELL, date: 2025-01-09T10:00:00Z, asset: ETF, quantity: 10, unit_price: 10, amount: 100, currency: USD }\n",
+            "  - { id: later, account: b, type: ADJUSTMENT, subtype: NOTIONAL_DISTRIBUTION, date: 2025-01-09T10:00:00Z, asset: ETF, amount: 10, currency: USD }\n",
+            "  - { id: later, account: b, type: ADJUSTMENT, subtype: RETURN_OF_CAPITAL, date: 2025-01-09T10:00:00Z, asset: ETF, amount: 10, currency: USD }\n",
+        ] {
+            let yaml = unquoted_transfer(fee).replace("as_of: 2025-01-08", "as_of: 2025-01-10")
+                .replace("fx_rates:", &format!("{later}fx_rates:"));
+            let p = inline(&yaml);
+            let day = |account: &str| p.series[&AccountId::new(account)].days.iter()
+                .find(|day| day.date.to_string() == "2025-01-08").unwrap();
+            assert_eq!(day("a").flow.outflow_base, dec!(148));
+            assert_eq!(day("b").flow.inflow_base, dec!(148), "fee {fee}; {later}");
+            let receiver = AccountId::new("b");
+            let lots: Vec<_> = p.lots().into_iter().filter(|lot| lot.account == receiver).collect();
+            let disposals: Vec<_> = p.bundle.disposals.iter().filter(|d| d.account == receiver).cloned().collect();
+            let scoped = effects(&p.resolved(), &disposals, &lots, &p.bundle.rejected_activities());
+            let incoming = scoped.events.iter().find(|event| event.id.as_str() == "in").unwrap();
+            assert_eq!(incoming.flow.unwrap().amount, dec!(148));
+
+            let before = inline(&unquoted_transfer(fee));
+            let checkpoint = serde_json::to_string(&before.bundle.final_state).unwrap();
+            let resumed = project(
+                p.ledger(), p.facts(), &p.fx(),
+                Some(serde_json::from_str(&checkpoint).unwrap()),
+                DateRange { start: "2025-01-09".parse().unwrap(), end: "2025-01-10".parse().unwrap() },
+            ).unwrap();
+            assert_eq!(resumed.final_state, p.bundle.final_state, "checkpoint: {later}");
+            let resumed_lots: Vec<_> = lot_records(&resumed, p.facts(), &p.fx()).into_iter()
+                .filter(|lot| lot.account == receiver).collect();
+            assert_eq!(resumed_lots, lots, "receiver rows after checkpoint: {later}");
+        }
+    }
+}
+
+#[test]
+fn transfer_chain_records_each_lots_own_opening_basis() {
+    let yaml = unquoted_transfer("5").replace("as_of: 2025-01-08", "as_of: 2025-01-10")
+        .replace("  - { id: b, currency: CAD }", "  - { id: b, currency: CAD }\n  - { id: c, currency: CAD }")
+        .replace("fx_rates:", "  - { id: nd2, account: b, type: ADJUSTMENT, subtype: NOTIONAL_DISTRIBUTION, date: 2025-01-09T10:00:00Z, asset: ETF, amount: 10, currency: USD }\n  - { id: out2, account: b, type: TRANSFER_OUT, date: 2025-01-10T10:00:00Z, asset: ETF, quantity: 10, unit_price: 10, source_group_id: g2 }\n  - { id: in2, account: c, type: TRANSFER_IN, date: 2025-01-10T11:00:00Z, asset: ETF, quantity: 10, unit_price: 10, source_group_id: g2, currency: USD }\nfx_rates:");
+    let p = inline(&yaml);
+    let lots = p.lots();
+    let cost = |account: &str| {
+        lots.iter()
+            .find(|lot| lot.account.as_str() == account)
+            .unwrap()
+            .original_cost_basis_base
+    };
+    assert_eq!(cost("a"), dec!(120));
+    assert_eq!(cost("b"), dec!(154));
+    assert_eq!(cost("c"), dec!(168));
+    let last = |account: &str| p.series[&AccountId::new(account)].days.last().unwrap();
+    assert_eq!(last("b").flow.outflow_base, dec!(168));
+    // C starts on delivery day: its daily series treats that row as the
+    // inception baseline. The event still carries the full incoming flow.
+    let delivered = effects(
+        &p.resolved(),
+        &p.bundle.disposals,
+        &lots,
+        &p.bundle.rejected_activities(),
+    );
+    let incoming = delivered
+        .events
+        .iter()
+        .find(|event| event.id.as_str() == "in2")
+        .unwrap();
+    assert_eq!(incoming.flow.unwrap().amount, dec!(168));
+}
+
+#[test]
+fn a_sale_of_known_zero_base_basis_is_realized_but_missing_fx_stays_excluded() {
+    let yaml = WAC_FOREIGN.replace("rate: 4 }", "rate: 20 }").replace("quotes:", "  - { id: sell, account: a, type: SELL, date: 2025-01-08T10:00:00Z, asset: ETF, quantity: 1, unit_price: 10, amount: 10, currency: USD }\nquotes:");
+    let p = inline(&yaml);
+    let lots = p.lots();
+    let result = measure_account(
+        &p.measure_inputs(&lots),
+        &AccountId::new("a"),
+        Window::default(),
+        MeasureProfile::Full,
+        false,
+    )
+    .unwrap();
+    assert_eq!(result.attribution.realized_pnl, dec!(249));
+    let missing: Vec<_> = lots
+        .into_iter()
+        .map(|mut lot| {
+            lot.fx_rate_to_base = dec!(0);
+            lot
+        })
+        .collect();
+    let degraded = measure_account(
+        &p.measure_inputs(&missing),
+        &AccountId::new("a"),
+        Window::default(),
+        MeasureProfile::Full,
+        false,
+    )
+    .unwrap();
+    assert_eq!(degraded.attribution.realized_pnl, dec!(49));
+    assert!(degraded
+        .data_quality
+        .warnings
+        .iter()
+        .any(|warning| matches!(
+            warning,
+            wealthfolio_portfolio_engine::model::QualityNote::RealizedSkippedAcquisitionFx { .. }
+        )));
 }

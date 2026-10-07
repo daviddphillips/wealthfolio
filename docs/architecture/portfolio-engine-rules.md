@@ -105,6 +105,11 @@ or out (§8). Fixtures: EDGE-MIX-03, EDGE-MIX-05, EDGE-MIX-06.
 - The incoming leg flows the cost of every unit it delivered, the lots it opened
   and the units that covered a short, less its fee as capitalised into those
   lots.
+- A receiving lot's original-cost columns record its book cost on delivery,
+  including its capitalized fee. Checkpoints preserve that opening amount
+  separately from current cost, so later adjustments or disposals cannot change
+  the historical incoming flow. Its acquisition price, date, rates and purchase
+  charges retain the source lot's history.
 - Costs keep the sender's historical rates to the base currency, as opened lots
   do, whether or not a rate exists on the transfer day. A cover's proceeds in
   base are that delivered cost even when the covered short's own cost has no
@@ -348,12 +353,14 @@ How each moves cost:
   the property was acquired and returns of capital were received", and a
   reinvested distribution counts at its own date. The lot keeps that book cost
   apart from its acquisition rates, so its purchase price and charges, and what
-  its purchase and charges cost in the account and base currency, stay as bought
-  (its lot row and the transfers it opened read them). A disposal takes its
-  units' share of the book cost. A transfer that covers an opposite position
-  divides those book costs between the covered and remaining units. A
-  capitalized transfer fee increases explicit book costs at the carried
-  acquisition rates, following the existing transfer-fee policy (R2.4).
+  its purchase and charges cost in the account and base currency, stay as
+  bought. A receiving lot records its opening book cost separately (R2.4). A
+  disposal takes its units' share of the book cost. A transfer that covers an
+  opposite position divides those book costs between the covered and remaining
+  units. A capitalized transfer fee increases explicit book costs at the carried
+  acquisition rates, following the existing transfer-fee policy (R2.4). A zero
+  cost in one currency does not discard a nonzero cost in another; known zero
+  base cost remains valid for realized P&L.
 - A return of capital realizes nothing while the basis covers it. When a share
   exceeds the basis in either currency, the basis there goes to zero and the
   excess is realized P&L, recorded as a disposal row with no units: its proceeds

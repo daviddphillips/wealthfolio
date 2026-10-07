@@ -1762,6 +1762,15 @@ fn period_disposals<'a>(
 
 fn realized_effects(inputs: &MeasureInputs<'_>, disposals: &[&LotDisposal]) -> EffectSet {
     let base = inputs.base().as_str();
+    // Adjustments can legitimately exhaust foreign book cost while local
+    // cost remains. The lot's acquisition FX distinguishes that known zero
+    // from a disposal whose original basis never converted.
+    let known_acquisition: HashSet<_> = inputs
+        .lots
+        .iter()
+        .filter(|lot| lot.fx_rate_to_base > Decimal::ZERO)
+        .map(|lot| (&lot.account, lot.id.as_str()))
+        .collect();
     let mut set = EffectSet::default();
     for disposal in disposals {
         let foreign = !disposal.currency.as_str().eq_ignore_ascii_case(base);
@@ -1777,7 +1786,9 @@ fn realized_effects(inputs: &MeasureInputs<'_>, disposals: &[&LotDisposal]) -> E
                 && disposal.cost_basis_base.is_sign_positive());
         if foreign
             && !disposal.cost_basis.is_zero()
-            && (disposal.cost_basis_base.is_zero() || sign_mismatch)
+            && ((disposal.cost_basis_base.is_zero()
+                && !known_acquisition.contains(&(&disposal.account, disposal.lot_id.as_str())))
+                || (!disposal.cost_basis_base.is_zero() && sign_mismatch))
         {
             set.warnings
                 .push(QualityNote::RealizedSkippedAcquisitionFx {

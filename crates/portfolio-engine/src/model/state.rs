@@ -215,6 +215,22 @@ pub struct Lot {
         with = "crate::model::decimal_serde::option"
     )]
     pub book_cost_base: Option<Decimal>,
+    /// Book cost when this transferred lot opened, including its own fee.
+    /// Later adjustments/disposals change current cost, not these amounts.
+    /// Read models persist them in the existing original-cost columns;
+    /// acquisition price, dates, rates and charges remain purchase facts.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::model::decimal_serde::option"
+    )]
+    pub opening_cost_basis: Option<Decimal>,
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        with = "crate::model::decimal_serde::option"
+    )]
+    pub opening_cost_basis_base: Option<Decimal>,
 }
 
 impl Lot {

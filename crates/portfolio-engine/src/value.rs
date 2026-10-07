@@ -83,7 +83,10 @@ impl PricedPosition {
     fn basis_status(&self) -> BasisStatus {
         if self.alternative || self.quantity.is_zero() {
             BasisStatus::NotApplicable
-        } else if !self.total_cost_basis.is_zero() {
+        } else if !self.total_cost_basis.is_zero()
+            || self.cost_basis_account.is_some_and(|cost| !cost.is_zero())
+            || self.cost_basis_base.is_some_and(|cost| !cost.is_zero())
+        {
             BasisStatus::Complete
         } else {
             BasisStatus::Unknown
@@ -942,6 +945,9 @@ impl<'a> Valuer<'a> {
         let mut total = Decimal::ZERO;
         let mut converted = true;
         for (asset, position) in &keyframe.positions {
+            if position.quantity.is_zero() {
+                continue;
+            }
             match position_book_cost(
                 &self.fx,
                 position.alternative,
@@ -1369,6 +1375,8 @@ fn transfer_records(
                 });
             entry.units += lot.original_quantity;
             let known = !lot.fx_rate_to_base.is_zero() || lot.original_cost_basis.is_zero();
+            // Original cost is the receiving lot's opening book cost, kept
+            // apart from later adjustments and disposals (rules R2.4).
             // The fee is shared by the units each lot held when it opened.
             let weighted = arith::mul(lot.original_quantity, lot.split_ratio).and_then(|weight| {
                 let weight = weight.abs();
